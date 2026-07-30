@@ -67,25 +67,10 @@ fn parse_args() -> Result<Option<Cli>, String> {
 
 fn parse_apps_args(args: &[String]) -> Result<Option<Cli>, String> {
     let mut opts = apps::AppsOptions::default();
-    let mut iter = args.iter().peekable();
-    while let Some(arg) = iter.next() {
+    for arg in args {
         match arg.as_str() {
             "--json" => opts.json = true,
-            "--store" => opts.store = true,
-            "-v" | "--verbose" => opts.verbose = true,
             "--no-color" => opts.no_color = true,
-            "--sort" => {
-                let value = iter
-                    .next()
-                    .ok_or("--sort needs a value: name, size or date")?;
-                opts.sort = apps::SortKey::parse(value)
-                    .ok_or_else(|| format!("unknown sort key '{value}' (name, size, date)"))?;
-            }
-            s if s.starts_with("--sort=") => {
-                let value = &s["--sort=".len()..];
-                opts.sort = apps::SortKey::parse(value)
-                    .ok_or_else(|| format!("unknown sort key '{value}' (name, size, date)"))?;
-            }
             "-h" | "--help" => {
                 print_help();
                 return Ok(None);
@@ -210,12 +195,10 @@ ANALYZE OPTIONS (read-only disk usage explorer):
         --json           Print sizes as JSON and exit (for scripting)
         --top <n>        Entries shown per directory (default: 40)
 
-APPS OPTIONS (installed application inventory, read-only):
+APPS OPTIONS (installed application inventory, biggest first):
     [FILTER]             Only show apps whose name contains FILTER
-        --sort <key>     Sort by: name (default), size, date
-        --store          Include Microsoft Store / UWP packages (slower)
-        --json           Print the inventory as JSON
-    -v, --verbose        Also show publisher and install location
+        --json           Print the inventory as JSON (adds publisher,
+                         location, uninstall string)
 
 COMMON OPTIONS:
         --no-color       Disable colored output

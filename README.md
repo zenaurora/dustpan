@@ -24,10 +24,9 @@ dpan analyze D:\projects  # 分析指定目录
 dpan analyze --json       # JSON 输出供脚本使用；管道时自动降为一次性列表
 dpan analyze --top 20     # 每层最多显示 20 条
 
-dpan apps                 # 列出已安装应用（注册表 + 便携应用扫描）
-dpan apps chrome          # 名称过滤
-dpan apps --sort size -v  # 按占用排序，显示发布者/安装位置
-dpan apps --store --json  # 含 Store/UWP 应用，JSON 输出
+dpan apps                 # 列出已安装应用，占用从大到小
+dpan apps chrome          # 名称筛选
+dpan apps --json          # JSON 输出（含发布者/安装位置/卸载命令）
 ```
 
 ## analyze（只读磁盘占用浏览）
@@ -83,13 +82,13 @@ cargo check --target x86_64-pc-windows-msvc   # macOS/Linux 上做 Windows 目�
 
 ## apps（应用清单，只读）
 
-三个来源合并，解决“Windows 上装的东西很杂”的问题：
+`dpan apps [关键词]`，占用从大到小排列。两个来源合并，解决“Windows 上装的东西很杂”的问题：
 
 1. **注册表 Uninstall 键**（advapi32 FFI 直读）：HKLM 64 位 / HKLM WOW6432Node（32 位程序）/ HKCU（用户级安装）三个位置，并套用标准隐藏规则（`SystemComponent=1`、补丁条目、无名条目）——和 Geek Uninstaller 读的是同一份数据
-2. **Store/UWP 应用**（`--store`，可选）：PowerShell `Get-AppxPackage`，较慢
-3. **便携/绿色应用扫描**：注册表里没有的解压即用软件。默认扫 `%LOCALAPPDATA%\Programs`、`scoop\apps`（自动识别版本号）、`PortableApps`；自定义目录写在 `%APPDATA%\dustpan\portable_dirs.txt`（每行一个）。目录内两层以内含 `.exe` 才算应用，已在注册表出现的路径/同名应用自动去重
+2. **便携/绿色应用扫描**：注册表里没有的解压即用软件。默认扫 `%LOCALAPPDATA%\Programs`、`scoop\apps`（自动识别版本号）、`PortableApps`；自定义目录写在 `%APPDATA%\dustpan\portable_dirs.txt`（每行一个）。目录内两层以内含 `.exe` 才算应用，已在注册表出现的路径/同名应用自动去重
 
-输出列：名称、版本、占用（注册表 `EstimatedSize` 或实算目录大小）、安装日期、来源（system / sys32 / user / store / portable）。JSON 输出额外含 `UninstallString`，为将来的卸载功能预留。
+表格列：名称、版本、占用（注册表 `EstimatedSize` 或实算目录大小）、安装日期、来源（system / sys32 / user / portable）。发布者、安装位置、`UninstallString`（为将来卸载功能预留）在 `--json` 输出里。
+
 
 ## 致谢
 

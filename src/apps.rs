@@ -4,11 +4,11 @@
 //! 1. Registry uninstall keys (HKLM 64-bit, HKLM WOW6432Node, HKCU) — the
 //!    same three hives every uninstaller UI reads, with the standard hide
 //!    rules (SystemComponent, patch entries, nameless keys).
-//! 2. Store/UWP packages via PowerShell `Get-AppxPackage` (opt-in, slow).
-//! 3. A portable-app scanner for unzip-and-run software the registry does
+//! 2. A portable-app scanner for unzip-and-run software the registry does
 //!    not know about: well-known directories plus user-configured roots.
 //!
-//! Read-only: this module never modifies the registry or the filesystem.
+//! Deliberately minimal interface: `dpan apps [filter]`, always sorted by
+//! size descending. Read-only: never modifies the registry or filesystem.
 
 use std::collections::HashSet;
 use std::fs;
@@ -25,7 +25,6 @@ pub enum Source {
     Machine,
     Machine32,
     User,
-    Store,
     Portable,
 }
 
@@ -35,7 +34,6 @@ impl Source {
             Source::Machine => "system",
             Source::Machine32 => "sys32",
             Source::User => "user",
-            Source::Store => "store",
             Source::Portable => "portable",
         }
     }
@@ -54,74 +52,38 @@ pub struct AppEntry {
     pub source: Source,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum SortKey {
-    Name,
-    Size,
-    Date,
-}
-
-impl SortKey {
-    pub fn parse(s: &str) -> Option<SortKey> {
-        match s.to_ascii_lowercase().as_str() {
-            "name" => Some(SortKey::Name),
-            "size" => Some(SortKey::Size),
-            "date" => Some(SortKey::Date),
-            _ => None,
-        }
-    }
-}
-
+#[derive(Default)]
 pub struct AppsOptions {
     pub json: bool,
-    pub store: bool,
-    pub verbose: bool,
     pub no_color: bool,
-    pub sort: SortKey,
     pub filter: Option<String>,
 }
 
-impl Default for AppsOptions {
-    fn default() -> Self {
-        AppsOptions {
-            json: false,
-            store: false,
-            verbose: false,
-            no_color: false,
-            sort: SortKey::Name,
-            filter: None,
-        }
-    }
-}
-
 pub fn run(opts: &AppsOptions) -> ExitCode {
-    let mut apps = collect(opts.store);
+    let mut apps = collect();
     if let Some(filter) = &opts.filter {
         let needle = filter.to_lowercase();
         apps.retain(|a| a.name.to_lowercase().contains(&needle));
     }
-    sort_apps(&mut apps, opts.sort);
+    sort_apps(&mut apps);
 
     if opts.json {
         print_json(&apps);
         return ExitCode::SUCCESS;
     }
     let style = Style::auto(opts.no_color);
-    print_table(&apps, &style, opts.verbose);
+    print_table(&apps, &style);
     if !cfg!(windows) {
         println!(
             "{}",
-            style.dim("(registry and Store sources are Windows-only; only portable scan ran)")
+            style.dim("(registry source is Windows-only; only portable scan ran)")
         );
     }
     ExitCode::SUCCESS
 }
 
-fn collect(include_store: bool) -> Vec<AppEntry> {
+fn collect() -> Vec<AppEntry> {
     let mut apps = registry::collect();
-    if include_store {
-        apps.extend(store_apps());
-    }
     // Dedupe portable candidates against everything found so far.
     let known_locations: HashSet<String> = apps
         .iter()
@@ -145,23 +107,15 @@ fn norm_path(p: &str) -> String {
         .to_string()
 }
 
-pub fn sort_apps(apps: &mut [AppEntry], key: SortKey) {
-    match key {
-        SortKey::Name => apps.sort_by_key(|a| a.name.to_lowercase()),
-        SortKey::Size => apps.sort_by(|a, b| {
-            b.size_bytes
-                .unwrap_or(0)
-                .cmp(&a.size_bytes.unwrap_or(0))
-                .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-        }),
-        SortKey::Date => apps.sort_by(|a, b| {
-            b.install_date
-                .clone()
-                .unwrap_or_default()
-                .cmp(&a.install_date.clone().unwrap_or_default())
-                .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-        }),
-    }
+/// Biggest first — the question "what is eating my disk" answers itself;
+/// unknown sizes sink to the bottom, ties break by name.
+pub fn sort_apps(apps: &mut [AppEntry]) {
+    apps.sort_by(|a, b| {
+        b.size_bytes
+            .unwrap_or(0)
+            .cmp(&a.size_bytes.unwrap_or(0))
+            .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
 }
 
 /// Geek-style hide rules for raw registry entries.
@@ -389,48 +343,7 @@ mod registry {
 }
 
 // ---------------------------------------------------------------------------
-// Source 2: Store/UWP packages via PowerShell (opt-in with --store).
-// ---------------------------------------------------------------------------
-
-fn store_apps() -> Vec<AppEntry> {
-    if !cfg!(windows) {
-        return Vec::new();
-    }
-    let output = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "Get-AppxPackage | Where-Object { -not $_.IsFramework } | \
-             ForEach-Object { \"$($_.Name)`t$($_.Version)`t$($_.Publisher)`t$($_.InstallLocation)\" }",
-        ])
-        .output();
-    let Ok(out) = output else {
-        return Vec::new();
-    };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.split('\t');
-            let name = parts.next()?.trim().to_string();
-            if name.is_empty() {
-                return None;
-            }
-            Some(AppEntry {
-                name,
-                version: parts.next().unwrap_or("").to_string(),
-                publisher: parts.next().unwrap_or("").to_string(),
-                location: parts.next().unwrap_or("").to_string(),
-                uninstall_string: String::new(),
-                size_bytes: None,
-                install_date: None,
-                source: Source::Store,
-            })
-        })
-        .collect()
-}
-
-// ---------------------------------------------------------------------------
-// Source 3: portable-app scanner (pure filesystem, works everywhere).
+// Source 2: portable-app scanner (pure filesystem, works everywhere).
 // ---------------------------------------------------------------------------
 
 /// Directories where unzip-and-run apps typically live. Extra roots can be
@@ -549,7 +462,7 @@ fn scoop_version(app_dir: &Path) -> Option<String> {
 // Output.
 // ---------------------------------------------------------------------------
 
-fn print_table(apps: &[AppEntry], style: &Style, verbose: bool) {
+fn print_table(apps: &[AppEntry], style: &Style) {
     println!(
         "{}  {}",
         style.bold("Apps"),
@@ -570,14 +483,6 @@ fn print_table(apps: &[AppEntry], style: &Style, verbose: bool) {
             date,
             style.dim(app.source.label())
         );
-        if verbose {
-            if !app.publisher.is_empty() {
-                println!("      {}", style.dim(&app.publisher));
-            }
-            if !app.location.is_empty() {
-                println!("      {}", style.dim(&app.location));
-            }
-        }
     }
     // per-source tally, e.g. "system 12 · user 30 · portable 5"
     let mut counts: Vec<(Source, usize)> = Vec::new();
@@ -665,19 +570,16 @@ mod tests {
     }
 
     #[test]
-    fn sorting_by_each_key() {
+    fn sorting_biggest_first_unknown_last() {
         let mut apps = vec![
             entry("beta", Some(100), Some("2024-01-01")),
             entry("Alpha", Some(300), None),
             entry("gamma", None, Some("2025-06-01")),
         ];
-        sort_apps(&mut apps, SortKey::Name);
-        assert_eq!(apps[0].name, "Alpha");
-        sort_apps(&mut apps, SortKey::Size);
+        sort_apps(&mut apps);
         assert_eq!(apps[0].name, "Alpha"); // 300 bytes first
-        assert_eq!(apps[2].name, "gamma"); // None -> last
-        sort_apps(&mut apps, SortKey::Date);
-        assert_eq!(apps[0].name, "gamma"); // newest first
+        assert_eq!(apps[1].name, "beta");
+        assert_eq!(apps[2].name, "gamma"); // unknown size -> last
     }
 
     #[test]
