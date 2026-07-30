@@ -5,6 +5,7 @@
 //! `analyze` flow: one parallel tree scan -> read-only interactive explorer.
 
 mod analyze;
+mod apps;
 mod clean;
 mod safety;
 mod scan;
@@ -36,6 +37,7 @@ fn main() -> ExitCode {
     match parse_args() {
         Ok(Some(Cli::Clean(opts))) => run(&opts),
         Ok(Some(Cli::Analyze(opts))) => analyze::run(&opts),
+        Ok(Some(Cli::Apps(opts))) => apps::run(&opts),
         Ok(None) => ExitCode::SUCCESS, // --help / --version
         Err(msg) => {
             eprintln!("error: {msg}\n\nrun `dpan --help` for usage");
@@ -47,6 +49,7 @@ fn main() -> ExitCode {
 enum Cli {
     Clean(Options),
     Analyze(analyze::AnalyzeOptions),
+    Apps(apps::AppsOptions),
 }
 
 fn parse_args() -> Result<Option<Cli>, String> {
@@ -55,8 +58,48 @@ fn parse_args() -> Result<Option<Cli>, String> {
         if first == "analyze" || first == "analyse" {
             return parse_analyze_args(&args[1..]);
         }
+        if first == "apps" {
+            return parse_apps_args(&args[1..]);
+        }
     }
     parse_clean_args(&args)
+}
+
+fn parse_apps_args(args: &[String]) -> Result<Option<Cli>, String> {
+    let mut opts = apps::AppsOptions::default();
+    let mut iter = args.iter().peekable();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--json" => opts.json = true,
+            "--store" => opts.store = true,
+            "-v" | "--verbose" => opts.verbose = true,
+            "--no-color" => opts.no_color = true,
+            "--sort" => {
+                let value = iter
+                    .next()
+                    .ok_or("--sort needs a value: name, size or date")?;
+                opts.sort = apps::SortKey::parse(value)
+                    .ok_or_else(|| format!("unknown sort key '{value}' (name, size, date)"))?;
+            }
+            s if s.starts_with("--sort=") => {
+                let value = &s["--sort=".len()..];
+                opts.sort = apps::SortKey::parse(value)
+                    .ok_or_else(|| format!("unknown sort key '{value}' (name, size, date)"))?;
+            }
+            "-h" | "--help" => {
+                print_help();
+                return Ok(None);
+            }
+            s if s.starts_with('-') => return Err(format!("unknown argument: {s}")),
+            filter => {
+                if opts.filter.is_some() {
+                    return Err(format!("unexpected extra filter: {filter}"));
+                }
+                opts.filter = Some(filter.to_string());
+            }
+        }
+    }
+    Ok(Some(Cli::Apps(opts)))
 }
 
 fn parse_analyze_args(args: &[String]) -> Result<Option<Cli>, String> {
@@ -147,11 +190,12 @@ fn parse_categories(value: &str) -> Result<Vec<Category>, String> {
 
 fn print_help() {
     println!(
-        "dpan {VERSION} — lightweight Windows cache cleaner (inspired by tw93/Mole)
+        "dpan {VERSION} — lightweight Windows cache cleaner
 
 USAGE:
     dpan [clean] [OPTIONS]
     dpan analyze [PATH] [OPTIONS]
+    dpan apps [FILTER] [OPTIONS]
 
 CLEAN OPTIONS:
     -n, --dry-run        Preview what would be removed, delete nothing
@@ -166,14 +210,22 @@ ANALYZE OPTIONS (read-only disk usage explorer):
         --json           Print sizes as JSON and exit (for scripting)
         --top <n>        Entries shown per directory (default: 40)
 
+APPS OPTIONS (installed application inventory, read-only):
+    [FILTER]             Only show apps whose name contains FILTER
+        --sort <key>     Sort by: name (default), size, date
+        --store          Include Microsoft Store / UWP packages (slower)
+        --json           Print the inventory as JSON
+    -v, --verbose        Also show publisher and install location
+
 COMMON OPTIONS:
         --no-color       Disable colored output
     -h, --help           Show this help
     -V, --version        Show version
 
 FILES:
-    whitelist   %APPDATA%\\dustpan\\whitelist.txt   (one path/glob per line)
-    audit log   %LOCALAPPDATA%\\dustpan\\operations.log"
+    whitelist       %APPDATA%\\dustpan\\whitelist.txt       (one path/glob per line)
+    portable dirs   %APPDATA%\\dustpan\\portable_dirs.txt   (extra apps scan roots)
+    audit log       %LOCALAPPDATA%\\dustpan\\operations.log"
     );
 }
 

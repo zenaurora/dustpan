@@ -506,7 +506,7 @@ fn print_json(root: &Path, scan: &ScanResult) {
     println!("{out}");
 }
 
-fn json_escape(s: &str) -> String {
+pub fn json_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
