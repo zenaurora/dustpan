@@ -1,0 +1,17 @@
+[package]
+name = "dustpan"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight Windows cache cleaner, inspired by tw93/Mole. Zero dependencies."
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "dpan"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"
+codegen-units = 1
