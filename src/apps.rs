@@ -46,6 +46,9 @@ pub struct AppEntry {
     pub publisher: String,
     pub location: String,
     pub uninstall_string: String,
+    /// Registry key holding this entry, e.g. `HKLM\...\Uninstall\7-Zip`
+    /// (empty for portable apps). Used to report leftovers after uninstall.
+    pub reg_key: String,
     pub size_bytes: Option<u64>,
     /// ISO date (YYYY-MM-DD) when known.
     pub install_date: Option<String>,
@@ -82,7 +85,7 @@ pub fn run(opts: &AppsOptions) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn collect() -> Vec<AppEntry> {
+pub fn collect() -> Vec<AppEntry> {
     let mut apps = registry::collect();
     // Dedupe portable candidates against everything found so far.
     let known_locations: HashSet<String> = apps
@@ -150,145 +153,7 @@ pub fn fmt_install_date(raw: &str) -> Option<String> {
 #[cfg(windows)]
 mod registry {
     use super::{fmt_install_date, should_hide, AppEntry, Source};
-    use std::ffi::c_void;
-    use std::os::windows::ffi::OsStrExt;
-
-    type Hkey = *mut c_void;
-    const HKEY_LOCAL_MACHINE: isize = 0x8000_0002u32 as i32 as isize;
-    const HKEY_CURRENT_USER: isize = 0x8000_0001u32 as i32 as isize;
-    const KEY_READ: u32 = 0x2_0019;
-    const ERROR_SUCCESS: i32 = 0;
-    const ERROR_NO_MORE_ITEMS: i32 = 259;
-    const REG_SZ: u32 = 1;
-    const REG_EXPAND_SZ: u32 = 2;
-    const REG_DWORD: u32 = 4;
-
-    #[link(name = "advapi32")]
-    extern "system" {
-        fn RegOpenKeyExW(
-            key: Hkey,
-            sub_key: *const u16,
-            options: u32,
-            desired: u32,
-            result: *mut Hkey,
-        ) -> i32;
-        fn RegEnumKeyExW(
-            key: Hkey,
-            index: u32,
-            name: *mut u16,
-            name_len: *mut u32,
-            reserved: *mut u32,
-            class: *mut u16,
-            class_len: *mut u32,
-            last_write: *mut c_void,
-        ) -> i32;
-        fn RegQueryValueExW(
-            key: Hkey,
-            value_name: *const u16,
-            reserved: *mut u32,
-            value_type: *mut u32,
-            data: *mut u8,
-            data_len: *mut u32,
-        ) -> i32;
-        fn RegCloseKey(key: Hkey) -> i32;
-    }
-
-    fn wide(s: &str) -> Vec<u16> {
-        std::ffi::OsStr::new(s)
-            .encode_wide()
-            .chain(Some(0))
-            .collect()
-    }
-
-    /// RAII key handle.
-    struct Key(Hkey);
-
-    impl Key {
-        fn open(root: isize, path: &str) -> Option<Key> {
-            let mut out: Hkey = std::ptr::null_mut();
-            let rc =
-                unsafe { RegOpenKeyExW(root as Hkey, wide(path).as_ptr(), 0, KEY_READ, &mut out) };
-            (rc == ERROR_SUCCESS).then(|| Key(out))
-        }
-
-        fn subkeys(&self) -> Vec<String> {
-            let mut names = Vec::new();
-            let mut index = 0u32;
-            loop {
-                let mut buf = [0u16; 256];
-                let mut len = buf.len() as u32;
-                let rc = unsafe {
-                    RegEnumKeyExW(
-                        self.0,
-                        index,
-                        buf.as_mut_ptr(),
-                        &mut len,
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                    )
-                };
-                if rc == ERROR_NO_MORE_ITEMS {
-                    break;
-                }
-                if rc == ERROR_SUCCESS {
-                    names.push(String::from_utf16_lossy(&buf[..len as usize]));
-                }
-                index += 1;
-            }
-            names
-        }
-
-        fn string_value(&self, name: &str) -> String {
-            let mut ty = 0u32;
-            let mut buf = vec![0u8; 8192];
-            let mut len = buf.len() as u32;
-            let rc = unsafe {
-                RegQueryValueExW(
-                    self.0,
-                    wide(name).as_ptr(),
-                    std::ptr::null_mut(),
-                    &mut ty,
-                    buf.as_mut_ptr(),
-                    &mut len,
-                )
-            };
-            if rc != ERROR_SUCCESS || (ty != REG_SZ && ty != REG_EXPAND_SZ) {
-                return String::new();
-            }
-            let units: Vec<u16> = buf[..len as usize]
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                .collect();
-            String::from_utf16_lossy(&units)
-                .trim_end_matches('\0')
-                .to_string()
-        }
-
-        fn dword_value(&self, name: &str) -> Option<u32> {
-            let mut ty = 0u32;
-            let mut buf = [0u8; 4];
-            let mut len = buf.len() as u32;
-            let rc = unsafe {
-                RegQueryValueExW(
-                    self.0,
-                    wide(name).as_ptr(),
-                    std::ptr::null_mut(),
-                    &mut ty,
-                    buf.as_mut_ptr(),
-                    &mut len,
-                )
-            };
-            (rc == ERROR_SUCCESS && ty == REG_DWORD).then(|| u32::from_le_bytes(buf))
-        }
-    }
-
-    impl Drop for Key {
-        fn drop(&mut self) {
-            unsafe { RegCloseKey(self.0) };
-        }
-    }
+    use crate::reg::{Key, HKCU, HKLM};
 
     const UNINSTALL: &str = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
     const UNINSTALL_32: &str = r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall";
@@ -296,9 +161,9 @@ mod registry {
     pub fn collect() -> Vec<AppEntry> {
         let mut apps = Vec::new();
         let hives = [
-            (HKEY_LOCAL_MACHINE, UNINSTALL, Source::Machine),
-            (HKEY_LOCAL_MACHINE, UNINSTALL_32, Source::Machine32),
-            (HKEY_CURRENT_USER, UNINSTALL, Source::User),
+            (HKLM, UNINSTALL, Source::Machine),
+            (HKLM, UNINSTALL_32, Source::Machine32),
+            (HKCU, UNINSTALL, Source::User),
         ];
         for (root, path, source) in hives {
             let Some(hive) = Key::open(root, path) else {
@@ -321,7 +186,19 @@ mod registry {
                     version: key.string_value("DisplayVersion"),
                     publisher: key.string_value("Publisher"),
                     location: key.string_value("InstallLocation"),
-                    uninstall_string: key.string_value("UninstallString"),
+                    // prefer the vendor's silent command when present
+                    uninstall_string: {
+                        let quiet = key.string_value("QuietUninstallString");
+                        if quiet.is_empty() {
+                            key.string_value("UninstallString")
+                        } else {
+                            quiet
+                        }
+                    },
+                    reg_key: format!(
+                        "{}\\{path}\\{sub}",
+                        if root == HKLM { "HKLM" } else { "HKCU" }
+                    ),
                     // EstimatedSize is stored in KB
                     size_bytes: key.dword_value("EstimatedSize").map(|kb| kb as u64 * 1024),
                     install_date: fmt_install_date(&key.string_value("InstallDate")),
@@ -412,6 +289,7 @@ fn portable_apps() -> Vec<AppEntry> {
                 publisher: String::new(),
                 location: path.display().to_string(),
                 uninstall_string: String::new(),
+                reg_key: String::new(),
                 size_bytes: Some(crate::scan::entry_size(&path)),
                 install_date,
                 source: Source::Portable,
@@ -544,6 +422,7 @@ mod tests {
             publisher: String::new(),
             location: String::new(),
             uninstall_string: String::new(),
+            reg_key: String::new(),
             size_bytes: size,
             install_date: date.map(String::from),
             source: Source::Machine,

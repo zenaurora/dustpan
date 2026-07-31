@@ -105,6 +105,13 @@ impl<'a> Cleaner<'a> {
         }
         stats
     }
+
+    /// Public single-path removal for the uninstaller: same gate, same
+    /// audit log. Returns true when the path was actually removed.
+    pub fn remove_path(&mut self, path: &Path) -> bool {
+        let stats = self.remove_one(path);
+        stats.deleted > 0 && !self.dry_run
+    }
 }
 
 fn remove_entry(path: &Path) -> std::io::Result<()> {

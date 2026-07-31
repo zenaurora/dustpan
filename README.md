@@ -27,6 +27,13 @@ dpan analyze --top 20     # 每层最多显示 20 条
 dpan apps                 # 列出已安装应用，占用从大到小
 dpan apps chrome          # 名称筛选
 dpan apps --json          # JSON 输出（含发布者/安装位置/卸载命令）
+
+dpan uninstall 7-zip      # 卸载：厂商卸载器 → 扫残留 → 确认后清理
+dpan uninstall foo -n     # 只预览：会执行什么、会删什么
+
+dpan ctxmenu              # 列出所有右键菜单项（含来源 DLL/命令）
+dpan ctxmenu off 百度     # 隐藏某项（可逆，不删厂商键，免管理员）
+dpan ctxmenu on 百度      # 恢复
 ```
 
 ## analyze（只读磁盘占用浏览）
@@ -87,7 +94,26 @@ cargo check --target x86_64-pc-windows-msvc   # macOS/Linux 上做 Windows 目�
 1. **注册表 Uninstall 键**（advapi32 FFI 直读）：HKLM 64 位 / HKLM WOW6432Node（32 位程序）/ HKCU（用户级安装）三个位置，并套用标准隐藏规则（`SystemComponent=1`、补丁条目、无名条目）——和 Geek Uninstaller 读的是同一份数据
 2. **便携/绿色应用扫描**：注册表里没有的解压即用软件。默认扫 `%LOCALAPPDATA%\Programs`、`scoop\apps`（自动识别版本号）、`PortableApps`；自定义目录写在 `%APPDATA%\dustpan\portable_dirs.txt`（每行一个）。目录内两层以内含 `.exe` 才算应用，已在注册表出现的路径/同名应用自动去重
 
-表格列：名称、版本、占用（注册表 `EstimatedSize` 或实算目录大小）、安装日期、来源（system / sys32 / user / portable）。发布者、安装位置、`UninstallString`（为将来卸载功能预留）在 `--json` 输出里。
+表格列：名称、版本、占用（注册表 `EstimatedSize` 或实算目录大小）、安装日期、来源（system / sys32 / user / portable）。发布者、安装位置、`UninstallString` 在 `--json` 输出里。
+
+## uninstall（卸载 + 残留清理）
+
+`dpan uninstall <关键词>`，必须唯一命中（多个候选时列出让你细化关键词）。三步：
+
+1. **执行厂商卸载器**：MSI 条目统一规整为 `msiexec /x {GUID} /qb`（不管厂商写的是 `/I` 还是 `/X`）；其他程序优先用 `QuietUninstallString`，没有则用 `UninstallString`；便携应用没有卸载器，直接删目录（走安全闸门）。退出码 3010（需重启）视为成功，1602（用户取消）则中止后续步骤
+2. **残留扫描**：按应用名变体（去版本号、空格/连字符/下划线互换）扫 `%APPDATA%`、`%LOCALAPPDATA%`、`%PROGRAMDATA%` 及安装目录，支持 `发布者\应用` 两层布局
+3. **确认后删除**：残留列表带大小展示，确认后经同一套安全闸门 + 审计日志删除
+
+注册表残留只报告路径不动手——dustpan 对注册表的写入严格限制在 HKCU（见 ctxmenu）。`-n` 全程预览，`-y` 跳过两次确认。
+
+## ctxmenu（右键菜单管理）
+
+专治国产软件往右键菜单塞“XX扫描”“上传到XX网盘”的问题。枚举六个挂载点（`*`、`Directory`、`Directory\Background`、`Folder`、`Drive`、`AllFilesystemObjects`）下的两类条目：
+
+- **静态 verb**（`shell\<名字>`）：禁用 = 在 `HKCU\Software\Classes` 同路径写入 `LegacyDisable` 遮罩值，不碰厂商在 HKLM 的原键
+- **COM 扩展**（`shellex\ContextMenuHandlers`）：禁用 = 把 CLSID 加进微软官方的每用户拉黑键 `HKCU\...\Shell Extensions\Blocked`（ShellExView 同款机制）
+
+三条安全约束：**只写 HKCU**（免管理员）、**只禁用不删除**（`on` 完整恢复）、**Windows 自带项拒绝禁用**（来源在 System32/SysWOW64 的条目带 `[windows]` 标记且 `off` 会拒绝）。生效需新开 Explorer 窗口或重启 Explorer；Win11 新式菜单（非“显示更多选项”）的条目不在此机制内。
 
 
 ## 致谢

@@ -7,11 +7,15 @@
 mod analyze;
 mod apps;
 mod clean;
+mod ctxmenu;
+#[cfg(windows)]
+mod reg;
 mod safety;
 mod scan;
 mod targets;
 mod term;
 mod ui;
+mod uninstall;
 
 use std::process::ExitCode;
 
@@ -38,6 +42,8 @@ fn main() -> ExitCode {
         Ok(Some(Cli::Clean(opts))) => run(&opts),
         Ok(Some(Cli::Analyze(opts))) => analyze::run(&opts),
         Ok(Some(Cli::Apps(opts))) => apps::run(&opts),
+        Ok(Some(Cli::Uninstall(opts))) => uninstall::run(&opts),
+        Ok(Some(Cli::Ctxmenu(opts))) => ctxmenu::run(&opts),
         Ok(None) => ExitCode::SUCCESS, // --help / --version
         Err(msg) => {
             eprintln!("error: {msg}\n\nrun `dpan --help` for usage");
@@ -50,6 +56,8 @@ enum Cli {
     Clean(Options),
     Analyze(analyze::AnalyzeOptions),
     Apps(apps::AppsOptions),
+    Uninstall(uninstall::UninstallOptions),
+    Ctxmenu(ctxmenu::CtxOptions),
 }
 
 fn parse_args() -> Result<Option<Cli>, String> {
@@ -61,8 +69,93 @@ fn parse_args() -> Result<Option<Cli>, String> {
         if first == "apps" {
             return parse_apps_args(&args[1..]);
         }
+        if first == "uninstall" {
+            return parse_uninstall_args(&args[1..]);
+        }
+        if first == "ctxmenu" {
+            return parse_ctxmenu_args(&args[1..]);
+        }
     }
     parse_clean_args(&args)
+}
+
+fn parse_ctxmenu_args(args: &[String]) -> Result<Option<Cli>, String> {
+    let mut action = ctxmenu::Action::List;
+    let mut filter: Option<String> = None;
+    let mut json = false;
+    let mut no_color = false;
+    let mut rest = args;
+    if let Some(first) = rest.first() {
+        match first.as_str() {
+            "off" => {
+                action = ctxmenu::Action::Off;
+                rest = &rest[1..];
+            }
+            "on" => {
+                action = ctxmenu::Action::On;
+                rest = &rest[1..];
+            }
+            _ => {}
+        }
+    }
+    for arg in rest {
+        match arg.as_str() {
+            "--json" => json = true,
+            "--no-color" => no_color = true,
+            "-h" | "--help" => {
+                print_help();
+                return Ok(None);
+            }
+            s if s.starts_with('-') => return Err(format!("unknown argument: {s}")),
+            name => {
+                if filter.is_some() {
+                    return Err(format!("unexpected extra argument: {name}"));
+                }
+                filter = Some(name.to_string());
+            }
+        }
+    }
+    if action != ctxmenu::Action::List && filter.is_none() {
+        return Err("ctxmenu on/off needs an entry name, e.g. `dpan ctxmenu off 百度`".into());
+    }
+    Ok(Some(Cli::Ctxmenu(ctxmenu::CtxOptions {
+        action,
+        filter,
+        json,
+        no_color,
+    })))
+}
+
+fn parse_uninstall_args(args: &[String]) -> Result<Option<Cli>, String> {
+    let mut filter: Option<String> = None;
+    let mut dry_run = false;
+    let mut yes = false;
+    let mut no_color = false;
+    for arg in args {
+        match arg.as_str() {
+            "-n" | "--dry-run" => dry_run = true,
+            "-y" | "--yes" => yes = true,
+            "--no-color" => no_color = true,
+            "-h" | "--help" => {
+                print_help();
+                return Ok(None);
+            }
+            s if s.starts_with('-') => return Err(format!("unknown argument: {s}")),
+            name => {
+                if filter.is_some() {
+                    return Err(format!("unexpected extra argument: {name}"));
+                }
+                filter = Some(name.to_string());
+            }
+        }
+    }
+    let filter = filter.ok_or("uninstall needs an app name, e.g. `dpan uninstall 7-zip`")?;
+    Ok(Some(Cli::Uninstall(uninstall::UninstallOptions {
+        filter,
+        dry_run,
+        yes,
+        no_color,
+    })))
 }
 
 fn parse_apps_args(args: &[String]) -> Result<Option<Cli>, String> {
@@ -181,6 +274,8 @@ USAGE:
     dpan [clean] [OPTIONS]
     dpan analyze [PATH] [OPTIONS]
     dpan apps [FILTER] [OPTIONS]
+    dpan uninstall <FILTER> [OPTIONS]
+    dpan ctxmenu [off|on <NAME>] [OPTIONS]
 
 CLEAN OPTIONS:
     -n, --dry-run        Preview what would be removed, delete nothing
@@ -199,6 +294,17 @@ APPS OPTIONS (installed application inventory, biggest first):
     [FILTER]             Only show apps whose name contains FILTER
         --json           Print the inventory as JSON (adds publisher,
                          location, uninstall string)
+
+UNINSTALL OPTIONS (runs the vendor uninstaller, then sweeps leftovers):
+    <FILTER>             App to uninstall (must match exactly one)
+    -n, --dry-run        Show what would run and what would be deleted
+    -y, --yes            Skip both confirmation prompts
+
+CTXMENU OPTIONS (right-click menu manager, no admin needed):
+    dpan ctxmenu                 List all context-menu entries
+    dpan ctxmenu off <name>      Hide an entry (reversible, HKCU only)
+    dpan ctxmenu on <name>       Restore a hidden entry
+        --json                   List as JSON
 
 COMMON OPTIONS:
         --no-color       Disable colored output
