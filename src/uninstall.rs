@@ -204,12 +204,14 @@ fn run_vendor_uninstaller(app: &AppEntry, opts: &UninstallOptions, style: &Style
         println!("{}", style.yellow("not on Windows, skipping execution"));
         return true;
     }
-    match std::process::Command::new(&argv[0])
-        .args(&argv[1..])
-        .status()
-    {
-        Ok(status) => {
-            let code = status.code().unwrap_or(-1);
+    match launch_uninstaller_with(&argv, direct_exit_code, |args| {
+        println!(
+            "{}",
+            style.yellow("administrator permission required; opening UAC prompt...")
+        );
+        elevated_exit_code(args)
+    }) {
+        Ok(code) => {
             if !uninstaller_allows_cleanup(code) {
                 if code == 1602 {
                     println!("{} uninstall cancelled", style.dim("–"));
@@ -232,6 +234,176 @@ fn run_vendor_uninstaller(app: &AppEntry, opts: &UninstallOptions, style: &Style
         Err(e) => {
             eprintln!("failed to launch uninstaller: {e}");
             false
+        }
+    }
+}
+
+fn launch_uninstaller_with(
+    argv: &[String],
+    direct: impl FnOnce(&[String]) -> std::io::Result<i32>,
+    elevated: impl FnOnce(&[String]) -> std::io::Result<i32>,
+) -> std::io::Result<i32> {
+    match direct(argv) {
+        Err(error) if error.raw_os_error() == Some(740) => elevated(argv),
+        result => result,
+    }
+}
+
+fn direct_exit_code(argv: &[String]) -> std::io::Result<i32> {
+    std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .status()
+        .map(|status| status.code().unwrap_or(-1))
+}
+
+#[cfg(windows)]
+fn elevated_exit_code(argv: &[String]) -> std::io::Result<i32> {
+    windows_elevation::run(argv)
+}
+
+#[cfg(not(windows))]
+fn elevated_exit_code(_argv: &[String]) -> std::io::Result<i32> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "UAC elevation is only available on Windows",
+    ))
+}
+
+#[cfg(windows)]
+mod windows_elevation {
+    use std::ffi::{c_void, OsStr};
+    use std::io;
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+
+    type Handle = *mut c_void;
+
+    const SEE_MASK_NOCLOSEPROCESS: u32 = 0x0000_0040;
+    const SEE_MASK_NOASYNC: u32 = 0x0000_0100;
+    const SW_SHOWNORMAL: i32 = 1;
+    const INFINITE: u32 = 0xffff_ffff;
+    const WAIT_FAILED: u32 = 0xffff_ffff;
+
+    #[repr(C)]
+    struct ShellExecuteInfoW {
+        cb_size: u32,
+        f_mask: u32,
+        hwnd: Handle,
+        lp_verb: *const u16,
+        lp_file: *const u16,
+        lp_parameters: *const u16,
+        lp_directory: *const u16,
+        n_show: i32,
+        h_inst_app: Handle,
+        lp_id_list: *mut c_void,
+        lp_class: *const u16,
+        hkey_class: Handle,
+        dw_hot_key: u32,
+        h_icon_or_monitor: Handle,
+        h_process: Handle,
+    }
+
+    #[link(name = "shell32")]
+    extern "system" {
+        fn ShellExecuteExW(info: *mut ShellExecuteInfoW) -> i32;
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn WaitForSingleObject(handle: Handle, milliseconds: u32) -> u32;
+        fn GetExitCodeProcess(process: Handle, exit_code: *mut u32) -> i32;
+        fn CloseHandle(object: Handle) -> i32;
+    }
+
+    struct OwnedHandle(Handle);
+
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    fn wide(value: &str) -> Vec<u16> {
+        OsStr::new(value).encode_wide().chain(Some(0)).collect()
+    }
+
+    /// Quote one argument according to the Windows CommandLineToArgvW rules.
+    fn quote_arg(value: &str) -> String {
+        if !value.is_empty() && !value.chars().any(|c| c.is_whitespace() || c == '"') {
+            return value.to_string();
+        }
+        let mut out = String::from("\"");
+        let mut backslashes = 0usize;
+        for ch in value.chars() {
+            if ch == '\\' {
+                backslashes += 1;
+            } else if ch == '"' {
+                out.push_str(&"\\".repeat(backslashes * 2 + 1));
+                out.push('"');
+                backslashes = 0;
+            } else {
+                out.push_str(&"\\".repeat(backslashes));
+                backslashes = 0;
+                out.push(ch);
+            }
+        }
+        out.push_str(&"\\".repeat(backslashes * 2));
+        out.push('"');
+        out
+    }
+
+    pub fn run(argv: &[String]) -> io::Result<i32> {
+        let verb = wide("runas");
+        let file = wide(&argv[0]);
+        let parameters = argv[1..]
+            .iter()
+            .map(|arg| quote_arg(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let parameters = wide(&parameters);
+        let parameter_ptr = if argv.len() > 1 {
+            parameters.as_ptr()
+        } else {
+            ptr::null()
+        };
+        let mut info = ShellExecuteInfoW {
+            cb_size: std::mem::size_of::<ShellExecuteInfoW>() as u32,
+            f_mask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
+            hwnd: ptr::null_mut(),
+            lp_verb: verb.as_ptr(),
+            lp_file: file.as_ptr(),
+            lp_parameters: parameter_ptr,
+            lp_directory: ptr::null(),
+            n_show: SW_SHOWNORMAL,
+            h_inst_app: ptr::null_mut(),
+            lp_id_list: ptr::null_mut(),
+            lp_class: ptr::null(),
+            hkey_class: ptr::null_mut(),
+            dw_hot_key: 0,
+            h_icon_or_monitor: ptr::null_mut(),
+            h_process: ptr::null_mut(),
+        };
+
+        unsafe {
+            if ShellExecuteExW(&mut info) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if info.h_process.is_null() {
+                return Err(io::Error::other(
+                    "Windows launched the uninstaller without a process handle",
+                ));
+            }
+            let process = OwnedHandle(info.h_process);
+            if WaitForSingleObject(process.0, INFINITE) == WAIT_FAILED {
+                return Err(io::Error::last_os_error());
+            }
+            let mut exit_code = 0u32;
+            if GetExitCodeProcess(process.0, &mut exit_code) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(exit_code as i32)
         }
     }
 }
@@ -482,6 +654,25 @@ mod tests {
         assert!(!uninstaller_allows_cleanup(1602));
         assert!(!uninstaller_allows_cleanup(1603));
         assert!(!uninstaller_allows_cleanup(-1));
+    }
+
+    #[test]
+    fn elevation_required_retries_through_uac() {
+        use std::cell::Cell;
+
+        let elevated = Cell::new(false);
+        let argv = vec![r"D:\miHoYo Launcher\uninstall.exe".to_string()];
+        let result = launch_uninstaller_with(
+            &argv,
+            |_| Err(std::io::Error::from_raw_os_error(740)),
+            |_| {
+                elevated.set(true);
+                Ok(0)
+            },
+        );
+
+        assert_eq!(result.unwrap(), 0);
+        assert!(elevated.get(), "ERROR_ELEVATION_REQUIRED must invoke UAC");
     }
 
     #[test]

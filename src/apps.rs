@@ -449,7 +449,7 @@ fn pick_apps(apps: &mut [AppEntry], style: &Style) -> Vec<usize> {
     // keyed by location: survives re-sorting, prevents endless re-walks
     let mut size_attempted: HashSet<String> = HashSet::new();
     loop {
-        let viewport = term::term_rows().saturating_sub(7).clamp(3, 500);
+        let viewport = picker_viewport(term::term_rows());
         cursor = cursor.min(apps.len() - 1);
         if cursor < offset {
             offset = cursor;
@@ -530,6 +530,14 @@ fn pick_apps(apps: &mut [AppEntry], style: &Style) -> Vec<usize> {
     }
 }
 
+/// The frame can contain nine non-list rows: three header rows, the
+/// continuation marker, a footer spacer, and four detail/status rows.
+/// Reserving all of them prevents a full frame from scrolling the console
+/// and pushing its title off the top edge.
+fn picker_viewport(terminal_rows: usize) -> usize {
+    terminal_rows.saturating_sub(9).clamp(1, 500)
+}
+
 /// Guard against vendors writing overly broad InstallLocation values
 /// (e.g. `C:\Program Files` itself): require at least two path segments
 /// below the root before we agree to walk it.
@@ -552,6 +560,24 @@ fn draw_picker(
     selected: &HashSet<String>,
     message: &str,
 ) {
+    let out = render_picker(
+        apps, style, cursor, offset, viewport, computing, selected, message,
+    );
+    print!("{out}");
+    let _ = std::io::stdout().flush();
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_picker(
+    apps: &[AppEntry],
+    style: &Style,
+    cursor: usize,
+    offset: usize,
+    viewport: usize,
+    computing: bool,
+    selected: &HashSet<String>,
+    message: &str,
+) -> String {
     let mut out = String::from("\x1b[H\x1b[2J");
     let total: u64 = apps.iter().filter_map(|a| a.size_bytes).sum();
     let hint = if selected.is_empty() {
@@ -623,8 +649,12 @@ fn draw_picker(
     if !meta.is_empty() {
         out.push_str(&format!("{}\r\n", style.dim(&meta.join(" · "))));
     }
-    print!("{out}");
-    let _ = std::io::stdout().flush();
+    // A CRLF emitted on the terminal's last row scrolls the entire console
+    // by one line. Leave the cursor on the final rendered row instead.
+    if out.ends_with("\r\n") {
+        out.truncate(out.len() - 2);
+    }
+    out
 }
 
 fn print_table(apps: &[AppEntry], style: &Style) {
@@ -795,5 +825,38 @@ mod tests {
         // CJK: 10 cells max -> 4 wide chars (8) + ellipsis (1) = 9 cells
         assert_eq!(truncate("上传到百度网盘助手", 10), "上传到百…");
         assert!(display_width(&truncate("上传到百度网盘助手", 10)) <= 10);
+    }
+
+    #[test]
+    fn picker_frame_never_exceeds_terminal_height_while_scrolling() {
+        let mut apps: Vec<AppEntry> = (0..30)
+            .map(|i| entry(&format!("App {i}"), Some(1024), Some("2026-08-14")))
+            .collect();
+        for app in &mut apps {
+            app.location = r"C:\Program Files\Example".into();
+            app.publisher = "Example Publisher".into();
+        }
+        let rows = 24usize;
+        let viewport = picker_viewport(rows);
+        let mut selected = HashSet::new();
+        selected.insert(entry_key(&apps[20]));
+        let frame = render_picker(
+            &apps,
+            &Style::auto(),
+            20,
+            10,
+            viewport,
+            true,
+            &selected,
+            "selected App 20",
+        );
+        let rendered_lines = frame.split_terminator("\r\n").count();
+
+        assert!(frame.starts_with("\x1b[H\x1b[2JApps"));
+        assert!(!frame.ends_with("\r\n"));
+        assert!(
+            rendered_lines <= rows,
+            "{rendered_lines} rendered lines overflow {rows} terminal rows"
+        );
     }
 }
