@@ -19,6 +19,7 @@ pub enum Key {
     Bottom,
     PageUp,
     PageDown,
+    Number(u8),
     Other,
 }
 
@@ -43,6 +44,7 @@ pub fn read_key(input: &mut impl Read) -> Key {
         // in the apps picker Enter starts an uninstall, and pager muscle
         // memory (space = scroll) must never land there
         b' ' => Key::Space,
+        b'1'..=b'9' => Key::Number(b[0] - b'0'),
         0x1b => {
             // CSI sequence: the follow-up bytes are already buffered for
             // real arrow keys, so blocking reads are fine here.
@@ -308,6 +310,7 @@ mod tests {
         assert_eq!(key(b"q"), Key::Quit);
         assert_eq!(key(b"\r"), Key::Enter);
         assert_eq!(key(b" "), Key::Space); // select toggle, never an action
+        assert_eq!(key(b"4"), Key::Number(4));
         assert_eq!(key(b"u"), Key::Left);
     }
 

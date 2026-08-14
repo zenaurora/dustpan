@@ -525,7 +525,7 @@ fn pick_apps(apps: &mut [AppEntry], style: &Style) -> Vec<usize> {
                     .map(|(i, _)| i)
                     .collect();
             }
-            Key::Left | Key::Other => {}
+            Key::Number(_) | Key::Left | Key::Other => {}
         }
     }
 }

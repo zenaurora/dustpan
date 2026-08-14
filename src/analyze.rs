@@ -308,7 +308,7 @@ fn browse(root: &Path, scan: &ScanResult, style: &Style, top: usize, _raw: RawMo
                     message = "already at the scanned root".into();
                 }
             }
-            Key::Space | Key::Other => {}
+            Key::Number(_) | Key::Space | Key::Other => {}
         }
     }
 }

@@ -8,6 +8,7 @@ mod analyze;
 mod apps;
 mod clean;
 mod ctxmenu;
+mod menu;
 #[cfg(windows)]
 mod reg;
 mod safety;
@@ -39,6 +40,7 @@ struct Options {
 
 fn main() -> ExitCode {
     match parse_args() {
+        Ok(Some(Cli::Menu)) => run_menu(),
         Ok(Some(Cli::Clean(opts))) => run(&opts),
         Ok(Some(Cli::Analyze(opts))) => analyze::run(&opts),
         Ok(Some(Cli::Apps(opts))) => apps::run(&opts),
@@ -53,6 +55,7 @@ fn main() -> ExitCode {
 }
 
 enum Cli {
+    Menu,
     Clean(Options),
     Analyze(analyze::AnalyzeOptions),
     Apps(apps::AppsOptions),
@@ -62,6 +65,9 @@ enum Cli {
 
 fn parse_args() -> Result<Option<Cli>, String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.is_empty() {
+        return Ok(Some(Cli::Menu));
+    }
     if let Some(first) = args.first() {
         if first == "analyze" || first == "analyse" {
             return parse_analyze_args(&args[1..]);
@@ -77,6 +83,20 @@ fn parse_args() -> Result<Option<Cli>, String> {
         }
     }
     parse_clean_args(&args)
+}
+
+fn run_menu() -> ExitCode {
+    match menu::choose() {
+        Some(menu::Action::Clean) => run(&Options::default()),
+        Some(menu::Action::Apps) => apps::run(&apps::AppsOptions::default()),
+        Some(menu::Action::Analyze) => analyze::run(&analyze::AnalyzeOptions::default()),
+        Some(menu::Action::Ctxmenu) => ctxmenu::run(&ctxmenu::CtxOptions {
+            action: ctxmenu::Action::List,
+            filter: None,
+            json: false,
+        }),
+        None => ExitCode::SUCCESS,
+    }
 }
 
 fn parse_ctxmenu_args(args: &[String]) -> Result<Option<Cli>, String> {
@@ -262,7 +282,8 @@ fn print_help() {
         "dpan {VERSION} — lightweight Windows cache cleaner
 
 USAGE:
-    dpan [clean] [OPTIONS]
+    dpan                         Open the interactive menu
+    dpan clean [OPTIONS]
     dpan analyze [PATH] [OPTIONS]
     dpan apps [FILTER] [OPTIONS]
     dpan uninstall <FILTER> [OPTIONS]

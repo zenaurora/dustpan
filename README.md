@@ -12,12 +12,13 @@ Windows `clean`（缓存清理）+ `analyze`（磁盘占用浏览）的 CLI。
 ## 用法
 
 ```console
-dpan                     # 扫描 → 预览 → 确认 → 清理
-dpan --dry-run           # 只看能清多少，不删
-dpan --only dev,browser  # 限定类别：temp / system / browser / dev / apps
-dpan --list              # 列出本机命中的清理目标
-dpan --recycle-bin       # 顺便清空回收站
-dpan -y -v                # 跳过确认 + 显示每条跳过/失败原因
+dpan                     # 进入交互菜单，选择清理 / 应用 / 分析 / 右键菜单
+dpan clean               # 扫描 → 预览 → 确认 → 清理
+dpan clean --dry-run     # 只看能清多少，不删
+dpan clean --only dev,browser  # 限定类别：temp / system / browser / dev / apps
+dpan clean --list        # 列出本机命中的清理目标
+dpan clean --recycle-bin # 顺便清空回收站
+dpan clean -y -v         # 跳过确认 + 显示每条跳过/失败原因
 
 dpan analyze              # 分析用户目录，交互式逐层浏览
 dpan analyze D:\projects  # 分析指定目录
