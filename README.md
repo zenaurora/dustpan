@@ -24,9 +24,9 @@ dpan analyze D:\projects  # 分析指定目录
 dpan analyze --json       # JSON 输出供脚本使用；管道时自动降为一次性列表
 dpan analyze --top 20     # 每层最多显示 20 条
 
-dpan apps                 # 列出已安装应用，占用从大到小
+dpan apps                 # 交互式应用列表：j/k 移动，空格多选，Enter 卸载，q 退出
 dpan apps chrome          # 名称筛选
-dpan apps --json          # JSON 输出（含发布者/安装位置/卸载命令）
+dpan apps --json          # JSON 输出（含发布者/安装位置/卸载命令；管道时自动降为纯文本表格）
 
 dpan uninstall 7-zip      # 卸载：厂商卸载器 → 扫残留 → 确认后清理
 dpan uninstall foo -n     # 只预览：会执行什么、会删什么
@@ -87,20 +87,25 @@ cargo check --target x86_64-pc-windows-msvc   # macOS/Linux 上做 Windows 目�
 
 模板路径统一用 `\` 书写，展开时按宿主 OS 转换分隔符，因此全部逻辑在 macOS/Linux 上可测试，实际清理目标只在 Windows 环境变量存在时才会命中。
 
-## apps（应用清单，只读）
+## apps（应用清单 + 交互式卸载入口）
 
-`dpan apps [关键词]`，占用从大到小排列。两个来源合并，解决“Windows 上装的东西很杂”的问题：
+`dpan apps [关键词]`，占用从大到小排列。在终端里直接进入全屏列表：`j/k` 移动，底部实时显示选中应用的**磁盘位置、占用大小、发布者、安装日期**（注册表没写大小的应用会在选中时按安装目录实算并重新排序）。
+
+**空格 = 多选标记**（fzf/LazyVim 习惯）：按下即时在底部提示 `● selected Dota 2 — 2 marked, 127.8 GB`，已标记行显示 `●` 并高亮，光标自动下移，再按取消。`Enter`：有标记时先列清单一次性确认后**批量卸载**；无标记时卸载当前行（单独确认）。`q` 退出。输出被管道时自动降为一次性表格。
+
+三个来源合并，解决“Windows 上装的东西很杂”的问题：
 
 1. **注册表 Uninstall 键**（advapi32 FFI 直读）：HKLM 64 位 / HKLM WOW6432Node（32 位程序）/ HKCU（用户级安装）三个位置，并套用标准隐藏规则（`SystemComponent=1`、补丁条目、无名条目）——和 Geek Uninstaller 读的是同一份数据
-2. **便携/绿色应用扫描**：注册表里没有的解压即用软件。默认扫 `%LOCALAPPDATA%\Programs`、`scoop\apps`（自动识别版本号）、`PortableApps`；自定义目录写在 `%APPDATA%\dustpan\portable_dirs.txt`（每行一个）。目录内两层以内含 `.exe` 才算应用，已在注册表出现的路径/同名应用自动去重
+2. **Steam 游戏**：直接解析 Steam 自己的库清单（`libraryfolders.vdf` + `appmanifest_*.acf`），拿到**精确的 SizeOnDisk 和安装目录**。vdf 里记录了用户添加的所有库（不限盘符）；若根目录探测失败，还会扫描各盘符根部的 `X:\SteamLibrary` 兜底，库路径按大小写/分隔符归一化去重。注册表里那些没大小的 “Steam App XXX” 条目仅在 ACF 扫描成功时才被替换，扫不到则保留原条目不丢游戏
+3. **便携/绿色应用扫描**：注册表里没有的解压即用软件。默认扫 `%LOCALAPPDATA%\Programs`、`scoop\apps`（自动识别版本号）、`PortableApps`；自定义目录写在 `%APPDATA%\dustpan\portable_dirs.txt`（每行一个）
 
-表格列：名称、版本、占用（注册表 `EstimatedSize` 或实算目录大小）、安装日期、来源（system / sys32 / user / portable）。发布者、安装位置、`UninstallString` 在 `--json` 输出里。
+表格列：名称、版本、占用、安装日期、来源（system / sys32 / user / steam / portable）。发布者、安装位置、`UninstallString` 在 `--json` 输出里（注意：`source` 枚举含 `steam`，Steam 条目的 `uninstall` 字段是 `steam://` 协议 URL 而非可执行命令）。
 
 ## uninstall（卸载 + 残留清理）
 
-`dpan uninstall <关键词>`，必须唯一命中（多个候选时列出让你细化关键词）。三步：
+**卸载方式：优先走软件自己的卸载器，不是强制删除。**`dpan uninstall <关键词>`（或在 `dpan apps` 里按 Enter），必须唯一命中。三步：
 
-1. **执行厂商卸载器**：MSI 条目统一规整为 `msiexec /x {GUID} /qb`（不管厂商写的是 `/I` 还是 `/X`）；其他程序优先用 `QuietUninstallString`，没有则用 `UninstallString`；便携应用没有卸载器，直接删目录（走安全闸门）。退出码 3010（需重启）视为成功，1602（用户取消）则中止后续步骤
+1. **执行厂商卸载器**：MSI 条目统一规整为 `msiexec /x {GUID} /qb`（不管厂商写的是 `/I` 还是 `/X`）；其他程序优先用 `QuietUninstallString`，没有则用 `UninstallString`；Steam 游戏通过 `steam://uninstall/<appid>` 交给 Steam 自己处理（不跑残留扫描，避免误伤存档）；只有便携应用（本来就没卸载器）才直接删目录，且走安全闸门。退出码 3010（需重启）视为成功，1602（用户取消）则中止后续步骤
 2. **残留扫描**：按应用名变体（去版本号、空格/连字符/下划线互换）扫 `%APPDATA%`、`%LOCALAPPDATA%`、`%PROGRAMDATA%` 及安装目录，支持 `发布者\应用` 两层布局
 3. **确认后删除**：残留列表带大小展示，确认后经同一套安全闸门 + 审计日志删除
 

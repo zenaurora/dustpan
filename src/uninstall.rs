@@ -26,11 +26,10 @@ pub struct UninstallOptions {
     pub filter: String,
     pub dry_run: bool,
     pub yes: bool,
-    pub no_color: bool,
 }
 
 pub fn run(opts: &UninstallOptions) -> ExitCode {
-    let style = Style::auto(opts.no_color);
+    let style = Style::auto();
     let needle = opts.filter.to_lowercase();
     let mut apps: Vec<AppEntry> = apps::collect()
         .into_iter()
@@ -62,6 +61,16 @@ pub fn run(opts: &UninstallOptions) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    uninstall_app(app, opts, false)
+}
+
+/// Uninstall one already-resolved app: confirm -> vendor uninstaller (or
+/// gate-checked delete for portable) -> leftover sweep. Also the entry
+/// point for the interactive `dpan apps` picker; `pre_confirmed` skips
+/// the per-app prompt when a batch confirmation was already given
+/// (leftover-sweep prompts still apply).
+pub fn uninstall_app(app: &AppEntry, opts: &UninstallOptions, pre_confirmed: bool) -> ExitCode {
+    let style = Style::auto();
 
     println!(
         "{}  {} {}  {}",
@@ -78,7 +87,7 @@ pub fn run(opts: &UninstallOptions) -> ExitCode {
             "{}",
             style.yellow("(dry run: nothing will be executed or deleted)")
         );
-    } else if !opts.yes && !confirm(&format!("\nUninstall {}?", app.name)) {
+    } else if !pre_confirmed && !opts.yes && !confirm(&format!("\nUninstall {}?", app.name)) {
         println!("Aborted.");
         return ExitCode::SUCCESS;
     }
@@ -89,6 +98,17 @@ pub fn run(opts: &UninstallOptions) -> ExitCode {
     };
     if !ok {
         return ExitCode::FAILURE;
+    }
+
+    if app.source == Source::Steam {
+        // Steam uninstalls asynchronously in its own UI and owns the game
+        // files (plus cloud saves); sweeping right now would race it and
+        // could hit save-game directories. Hands off.
+        println!(
+            "{}",
+            style.dim("Steam will finish the uninstall in its own window; no leftover sweep")
+        );
+        return ExitCode::SUCCESS;
     }
 
     // Leftover sweep: app data the vendor uninstaller typically leaves behind.
@@ -104,10 +124,21 @@ pub fn run(opts: &UninstallOptions) -> ExitCode {
 /// Turn an UninstallString into an argv. MSI entries get normalized to
 /// `msiexec /x {GUID} /qb` regardless of how the vendor spelled them
 /// (`/I{GUID}`, `/X{GUID}`, mixed quoting...), following BCUninstaller.
+/// steam:// protocol URLs are handed to the shell so Steam picks them up.
 pub fn uninstall_command(uninstall_string: &str) -> Option<Vec<String>> {
     let s = uninstall_string.trim();
     if s.is_empty() {
         return None;
+    }
+    if s.starts_with("steam://") {
+        // `start` resolves the protocol handler; empty "" is the window title
+        return Some(vec![
+            "cmd".into(),
+            "/C".into(),
+            "start".into(),
+            "".into(),
+            s.into(),
+        ]);
     }
     if let Some(guid) = extract_msi_guid(s) {
         return Some(vec![
@@ -177,20 +208,26 @@ fn run_vendor_uninstaller(app: &AppEntry, opts: &UninstallOptions, style: &Style
         .args(&argv[1..])
         .status()
     {
-        Ok(status) if status.success() => {
-            println!("{} vendor uninstaller finished", style.green("✓"));
-            true
-        }
         Ok(status) => {
-            // 3010 = success, reboot required; 1602 = user cancelled
             let code = status.code().unwrap_or(-1);
+            if !uninstaller_allows_cleanup(code) {
+                if code == 1602 {
+                    println!("{} uninstall cancelled", style.dim("–"));
+                } else {
+                    eprintln!("uninstaller exited with code {code}");
+                }
+                return false;
+            }
             if code == 3010 {
                 println!("{} uninstalled (reboot required)", style.green("✓"));
-                true
+            } else if app.source == Source::Steam {
+                // `start` only dispatches the URL: Steam confirms and
+                // uninstalls asynchronously, so don't claim completion.
+                println!("{} handed off to Steam — confirm there", style.green("✓"));
             } else {
-                eprintln!("uninstaller exited with code {code}");
-                code != 1602 // user cancel: stop quietly, no leftover sweep
+                println!("{} vendor uninstaller finished", style.green("✓"));
             }
+            true
         }
         Err(e) => {
             eprintln!("failed to launch uninstaller: {e}");
@@ -199,10 +236,14 @@ fn run_vendor_uninstaller(app: &AppEntry, opts: &UninstallOptions, style: &Style
     }
 }
 
+fn uninstaller_allows_cleanup(code: i32) -> bool {
+    matches!(code, 0 | 3010)
+}
+
 fn uninstall_portable(app: &AppEntry, opts: &UninstallOptions, style: &Style) -> bool {
     // Portable apps have no uninstaller: removing the directory is the
     // uninstall. Route it through the standard gate for safety + audit.
-    let safety = Safety::load();
+    let safety = Safety::load().with_extra_allowed_bases(&apps::portable_roots());
     let path = PathBuf::from(&app.location);
     if let Err(reason) = safety.check(&path) {
         eprintln!("refusing to delete {}: {reason}", path.display());
@@ -281,11 +322,15 @@ fn leftover_roots() -> Vec<PathBuf> {
 }
 
 pub fn find_leftovers(app: &AppEntry) -> Vec<Leftover> {
+    find_leftovers_in_roots(app, &leftover_roots())
+}
+
+fn find_leftovers_in_roots(app: &AppEntry, roots: &[PathBuf]) -> Vec<Leftover> {
     let variants = name_variants(&app.name);
     let publisher = app.publisher.trim().to_lowercase();
     let mut found = Vec::new();
-    for root in leftover_roots() {
-        let Ok(rd) = std::fs::read_dir(&root) else {
+    for root in roots {
+        let Ok(rd) = std::fs::read_dir(root) else {
             continue;
         };
         for entry in rd.flatten() {
@@ -294,21 +339,30 @@ pub fn find_leftovers(app: &AppEntry) -> Vec<Leftover> {
                 continue;
             }
             let dir_name = entry.file_name().to_string_lossy().to_lowercase();
-            let direct_hit = variants.contains(&dir_name);
-            // Publisher\App layout: Publisher dir containing a matching subdir
-            let nested_hit = !publisher.is_empty()
-                && dir_name == publisher
-                && std::fs::read_dir(&path).is_ok_and(|sub| {
-                    sub.flatten().any(|e| {
-                        let n = e.file_name().to_string_lossy().to_lowercase();
-                        variants.contains(&n)
-                    })
-                });
-            if direct_hit || nested_hit {
+            if variants.contains(&dir_name) {
                 found.push(Leftover {
                     size: entry_size(&path),
                     path,
                 });
+                continue;
+            }
+            if publisher.is_empty() || dir_name != publisher {
+                continue;
+            }
+            // Publisher\App layout: collect only matching child directories.
+            // The publisher directory may contain unrelated sibling products.
+            let Ok(children) = std::fs::read_dir(&path) else {
+                continue;
+            };
+            for child in children.flatten() {
+                let child_path = child.path();
+                let child_name = child.file_name().to_string_lossy().to_lowercase();
+                if child_path.is_dir() && variants.contains(&child_name) {
+                    found.push(Leftover {
+                        size: entry_size(&child_path),
+                        path: child_path,
+                    });
+                }
             }
         }
     }
@@ -397,6 +451,12 @@ mod tests {
     }
 
     #[test]
+    fn steam_urls_launch_via_protocol_handler() {
+        let cmd = uninstall_command("steam://uninstall/570").unwrap();
+        assert_eq!(cmd, vec!["cmd", "/C", "start", "", "steam://uninstall/570"]);
+    }
+
+    #[test]
     fn exe_command_splitting() {
         let cmd = uninstall_command(r#""C:\Program Files\7-Zip\Uninstall.exe" /S"#).unwrap();
         assert_eq!(cmd[0], r"C:\Program Files\7-Zip\Uninstall.exe");
@@ -413,6 +473,48 @@ mod tests {
         // msiexec mention but broken guid -> treated as a plain command line
         let cmd = uninstall_command("msiexec.exe /x {not-a-guid}").unwrap();
         assert_eq!(cmd[0], "msiexec.exe");
+    }
+
+    #[test]
+    fn only_success_exit_codes_allow_leftover_cleanup() {
+        assert!(uninstaller_allows_cleanup(0));
+        assert!(uninstaller_allows_cleanup(3010));
+        assert!(!uninstaller_allows_cleanup(1602));
+        assert!(!uninstaller_allows_cleanup(1603));
+        assert!(!uninstaller_allows_cleanup(-1));
+    }
+
+    #[test]
+    fn publisher_layout_returns_only_the_matching_app_directory() {
+        let root =
+            std::env::temp_dir().join(format!("dpan-leftovers-publisher-{}", std::process::id()));
+        let publisher = root.join("Acme");
+        let wanted = publisher.join("My App");
+        let sibling = publisher.join("Other App");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&wanted).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(wanted.join("cache.bin"), b"wanted").unwrap();
+        std::fs::write(sibling.join("keep.bin"), b"keep").unwrap();
+
+        let app = AppEntry {
+            name: "My App".into(),
+            version: String::new(),
+            publisher: "Acme".into(),
+            location: String::new(),
+            uninstall_string: String::new(),
+            reg_key: String::new(),
+            size_bytes: None,
+            install_date: None,
+            source: Source::User,
+        };
+        let leftovers = find_leftovers_in_roots(&app, std::slice::from_ref(&root));
+        let paths: Vec<&std::path::Path> = leftovers.iter().map(|l| l.path.as_path()).collect();
+
+        assert_eq!(paths, vec![wanted.as_path()]);
+        assert!(!paths.contains(&publisher.as_path()));
+        assert!(!paths.contains(&sibling.as_path()));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

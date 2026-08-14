@@ -3,7 +3,7 @@
 //! console modes via kernel32 FFI and enables VT input so arrow keys arrive
 //! as CSI sequences on both platforms, letting one parser handle everything.
 
-use std::io::Read;
+use std::io::{Read, Write};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Key {
@@ -12,6 +12,8 @@ pub enum Key {
     Left,
     Right,
     Enter,
+    /// Multi-select toggle in pickers; never an action trigger.
+    Space,
     Quit,
     Top,
     Bottom,
@@ -35,9 +37,12 @@ pub fn read_key(input: &mut impl Read) -> Key {
         b'l' => Key::Right,
         b'g' => Key::Top,
         b'G' => Key::Bottom,
-        0x15 => Key::PageUp,   // Ctrl-U
-        0x06 => Key::PageDown, // Ctrl-F
-        b'\r' | b'\n' | b' ' => Key::Enter,
+        0x15 => Key::PageUp,         // Ctrl-U
+        0x06 => Key::PageDown,       // Ctrl-F
+        b'\r' | b'\n' => Key::Enter, // Space is select-toggle, NOT Enter:
+        // in the apps picker Enter starts an uninstall, and pager muscle
+        // memory (space = scroll) must never land there
+        b' ' => Key::Space,
         0x1b => {
             // CSI sequence: the follow-up bytes are already buffered for
             // real arrow keys, so blocking reads are fine here.
@@ -75,6 +80,12 @@ pub fn term_rows() -> usize {
     imp::term_rows().unwrap_or(24)
 }
 
+/// Enable ANSI styling on stdout. Redirected output and unsupported consoles
+/// return false, so callers automatically fall back to plain text.
+pub fn enable_color() -> bool {
+    imp::enable_color()
+}
+
 /// RAII raw-mode guard: restores the terminal on drop, even on panic.
 pub struct RawMode {
     _inner: imp::RawGuard,
@@ -88,8 +99,28 @@ impl RawMode {
     }
 }
 
+/// RAII alternate-screen guard. Keeping it beside `RawMode` ensures every
+/// full-screen view uses the same enter/restore sequence.
+pub struct AltScreen;
+
+impl AltScreen {
+    pub fn enter() -> AltScreen {
+        print!("\x1b[?1049h\x1b[?25l");
+        let _ = std::io::stdout().flush();
+        AltScreen
+    }
+}
+
+impl Drop for AltScreen {
+    fn drop(&mut self) {
+        print!("\x1b[?25h\x1b[?1049l");
+        let _ = std::io::stdout().flush();
+    }
+}
+
 #[cfg(unix)]
 mod imp {
+    use std::io::IsTerminal;
     use std::process::{Command, Stdio};
 
     pub struct RawGuard {
@@ -136,6 +167,10 @@ mod imp {
             .next()?
             .parse()
             .ok()
+    }
+
+    pub fn enable_color() -> bool {
+        std::io::stdout().is_terminal()
     }
 }
 
@@ -191,6 +226,20 @@ mod imp {
         saved_out: u32,
     }
 
+    unsafe fn enable_vt_output(stdout: Handle) -> Option<u32> {
+        let mut saved = 0u32;
+        if GetConsoleMode(stdout, &mut saved) == 0
+            || SetConsoleMode(stdout, saved | ENABLE_VIRTUAL_TERMINAL_PROCESSING) == 0
+        {
+            return None;
+        }
+        Some(saved)
+    }
+
+    pub fn enable_color() -> bool {
+        unsafe { enable_vt_output(GetStdHandle(STD_OUTPUT_HANDLE)).is_some() }
+    }
+
     impl Drop for RawGuard {
         fn drop(&mut self) {
             unsafe {
@@ -204,10 +253,8 @@ mod imp {
         unsafe {
             let stdin = GetStdHandle(STD_INPUT_HANDLE);
             let stdout = GetStdHandle(STD_OUTPUT_HANDLE);
-            let (mut saved_in, mut saved_out) = (0u32, 0u32);
-            if GetConsoleMode(stdin, &mut saved_in) == 0
-                || GetConsoleMode(stdout, &mut saved_out) == 0
-            {
+            let mut saved_in = 0u32;
+            if GetConsoleMode(stdin, &mut saved_in) == 0 {
                 return None;
             }
             let raw_in = (saved_in
@@ -216,10 +263,10 @@ mod imp {
             if SetConsoleMode(stdin, raw_in) == 0 {
                 return None;
             }
-            if SetConsoleMode(stdout, saved_out | ENABLE_VIRTUAL_TERMINAL_PROCESSING) == 0 {
+            let Some(saved_out) = enable_vt_output(stdout) else {
                 SetConsoleMode(stdin, saved_in);
                 return None;
-            }
+            };
             Some(RawGuard {
                 stdin,
                 stdout,
@@ -260,7 +307,7 @@ mod tests {
         assert_eq!(key(b"G"), Key::Bottom);
         assert_eq!(key(b"q"), Key::Quit);
         assert_eq!(key(b"\r"), Key::Enter);
-        assert_eq!(key(b" "), Key::Enter);
+        assert_eq!(key(b" "), Key::Space); // select toggle, never an action
         assert_eq!(key(b"u"), Key::Left);
     }
 

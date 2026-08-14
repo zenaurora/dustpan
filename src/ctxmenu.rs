@@ -27,7 +27,6 @@ pub struct CtxOptions {
     pub action: Action,
     pub filter: Option<String>,
     pub json: bool,
-    pub no_color: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -111,7 +110,12 @@ impl MenuEntry {
     /// Windows' own entries: disabling those is usually a mistake.
     fn is_windows_builtin(&self) -> bool {
         let d = self.detail.to_lowercase();
-        d.contains("\\windows\\system32") || d.contains("\\windows\\syswow64")
+        d.contains("\\windows\\system32")
+            || d.contains("\\windows\\syswow64")
+            || d.contains("%systemroot%\\system32")
+            || d.contains("%systemroot%\\syswow64")
+            || d.contains("%windir%\\system32")
+            || d.contains("%windir%\\syswow64")
     }
 }
 
@@ -144,7 +148,7 @@ pub fn find_matches<'a>(entries: &'a [MenuEntry], needle: &str) -> Vec<&'a MenuE
 }
 
 pub fn run(opts: &CtxOptions) -> ExitCode {
-    let style = Style::auto(opts.no_color);
+    let style = Style::auto();
     if !cfg!(windows) && opts.action != Action::List {
         eprintln!("ctxmenu on/off only works on Windows");
         return ExitCode::FAILURE;
@@ -470,7 +474,13 @@ mod tests {
             r"C:\Windows\System32\shell32.dll",
         );
         let vendor = entry("scan", "XX扫描", r"C:\Program Files\XX\scan.dll");
+        let expandable = entry(
+            "copyaspath",
+            "Copy as path",
+            r"%SystemRoot%\System32\shell32.dll",
+        );
         assert!(win.is_windows_builtin());
+        assert!(expandable.is_windows_builtin());
         assert!(!vendor.is_windows_builtin());
     }
 }

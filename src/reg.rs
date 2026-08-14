@@ -72,11 +72,32 @@ extern "system" {
     fn RegCloseKey(key: Hkey) -> i32;
 }
 
+#[link(name = "kernel32")]
+extern "system" {
+    fn ExpandEnvironmentStringsW(src: *const u16, dest: *mut u16, size: u32) -> u32;
+}
+
 fn wide(s: &str) -> Vec<u16> {
     std::ffi::OsStr::new(s)
         .encode_wide()
         .chain(Some(0))
         .collect()
+}
+
+fn expand_environment_strings(value: &str) -> String {
+    let input = wide(value);
+    let needed = unsafe { ExpandEnvironmentStringsW(input.as_ptr(), std::ptr::null_mut(), 0) };
+    if needed == 0 {
+        return value.to_string();
+    }
+    let mut output = vec![0u16; needed as usize];
+    let written = unsafe {
+        ExpandEnvironmentStringsW(input.as_ptr(), output.as_mut_ptr(), output.len() as u32)
+    };
+    if written == 0 || written > output.len() as u32 {
+        return value.to_string();
+    }
+    String::from_utf16_lossy(&output[..written.saturating_sub(1) as usize])
 }
 
 /// RAII registry key handle.
@@ -175,9 +196,14 @@ impl Key {
             .chunks_exact(2)
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
-        String::from_utf16_lossy(&units)
+        let value = String::from_utf16_lossy(&units)
             .trim_end_matches('\0')
-            .to_string()
+            .to_string();
+        if ty == REG_EXPAND_SZ {
+            expand_environment_strings(&value)
+        } else {
+            value
+        }
     }
 
     pub fn dword_value(&self, name: &str) -> Option<u32> {

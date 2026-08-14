@@ -1,23 +1,19 @@
-//! Installed application inventory (`dpan apps`), modeled on how Geek
-//! Uninstaller discovers software:
-//!
-//! 1. Registry uninstall keys (HKLM 64-bit, HKLM WOW6432Node, HKCU) — the
-//!    same three hives every uninstaller UI reads, with the standard hide
-//!    rules (SystemComponent, patch entries, nameless keys).
-//! 2. A portable-app scanner for unzip-and-run software the registry does
-//!    not know about: well-known directories plus user-configured roots.
-//!
-//! Deliberately minimal interface: `dpan apps [filter]`, always sorted by
-//! size descending. Read-only: never modifies the registry or filesystem.
+//! Installed application inventory (`dpan apps`): registry uninstall
+//! keys, Steam library manifests, and a portable-app scanner, shown as a
+//! full-screen picker in a terminal (Enter hands the selected app to the
+//! uninstaller — with confirmation) or as a flat table when piped.
+//! Collection itself never modifies the registry or filesystem.
 
 use std::collections::HashSet;
 use std::fs;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::UNIX_EPOCH;
 
 use crate::clean::iso_from_unix;
-use crate::ui::{fmt_size, Style};
+use crate::term::{self, Key, RawMode};
+use crate::ui::{fmt_size, pad_to_width, truncate_width, Style};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[cfg_attr(not(windows), allow(dead_code))] // registry variants unused off-Windows
@@ -25,6 +21,7 @@ pub enum Source {
     Machine,
     Machine32,
     User,
+    Steam,
     Portable,
 }
 
@@ -34,6 +31,7 @@ impl Source {
             Source::Machine => "system",
             Source::Machine32 => "sys32",
             Source::User => "user",
+            Source::Steam => "steam",
             Source::Portable => "portable",
         }
     }
@@ -58,7 +56,6 @@ pub struct AppEntry {
 #[derive(Default)]
 pub struct AppsOptions {
     pub json: bool,
-    pub no_color: bool,
     pub filter: Option<String>,
 }
 
@@ -74,12 +71,16 @@ pub fn run(opts: &AppsOptions) -> ExitCode {
         print_json(&apps);
         return ExitCode::SUCCESS;
     }
-    let style = Style::auto(opts.no_color);
+    let style = Style::auto();
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    if interactive && !apps.is_empty() {
+        return browse(apps, &style);
+    }
     print_table(&apps, &style);
     if !cfg!(windows) {
         println!(
             "{}",
-            style.dim("(registry source is Windows-only; only portable scan ran)")
+            style.dim("(registry source is Windows-only; only portable/steam scans ran)")
         );
     }
     ExitCode::SUCCESS
@@ -87,6 +88,12 @@ pub fn run(opts: &AppsOptions) -> ExitCode {
 
 pub fn collect() -> Vec<AppEntry> {
     let mut apps = registry::collect();
+    // Steam games come from ACF manifests (exact sizes). Only drop the
+    // thin registry duplicates when the ACF scan actually delivered
+    // replacements — otherwise games would silently vanish whenever
+    // library discovery fails.
+    let steam_games = crate::steam::collect();
+    merge_steam_games(&mut apps, steam_games);
     // Dedupe portable candidates against everything found so far.
     let known_locations: HashSet<String> = apps
         .iter()
@@ -101,6 +108,20 @@ pub fn collect() -> Vec<AppEntry> {
             .filter(|p| !known_names.contains(&p.name.to_lowercase())),
     );
     apps
+}
+
+fn merge_steam_games(apps: &mut Vec<AppEntry>, steam_games: Vec<AppEntry>) {
+    let steam_ids: HashSet<String> = steam_games
+        .iter()
+        .filter_map(|game| crate::steam::registry_app_id(&game.name, &game.uninstall_string))
+        .collect();
+    apps.retain(
+        |app| match crate::steam::registry_app_id(&app.name, &app.uninstall_string) {
+            Some(id) => !steam_ids.contains(&id),
+            None => true,
+        },
+    );
+    apps.extend(steam_games);
 }
 
 fn norm_path(p: &str) -> String {
@@ -225,7 +246,7 @@ mod registry {
 
 /// Directories where unzip-and-run apps typically live. Extra roots can be
 /// added in `%APPDATA%\dustpan\portable_dirs.txt` (one per line).
-fn portable_roots() -> Vec<PathBuf> {
+pub(crate) fn portable_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     let var = |v: &str| std::env::var(v).ok().map(PathBuf::from);
     if let Some(local) = var("LOCALAPPDATA") {
@@ -337,8 +358,274 @@ fn scoop_version(app_dir: &Path) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Output.
+// Interactive browser: j/k move, Space multi-select, Enter uninstall,
+// q quit.
 // ---------------------------------------------------------------------------
+
+fn browse(mut apps: Vec<AppEntry>, style: &Style) -> ExitCode {
+    let picked = {
+        let Some(_raw) = RawMode::enter() else {
+            print_table(&apps, style);
+            return ExitCode::SUCCESS;
+        };
+        let _screen = term::AltScreen::enter();
+        pick_apps(&mut apps, style)
+        // raw mode + alt screen drop here, terminal is back to normal
+    };
+    if picked.is_empty() {
+        return ExitCode::SUCCESS; // quit without choosing
+    }
+    let un_opts = crate::uninstall::UninstallOptions {
+        filter: String::new(),
+        dry_run: false,
+        yes: false,
+    };
+    if picked.len() == 1 {
+        // single app: uninstall_app runs its own confirmation
+        return crate::uninstall::uninstall_app(&apps[picked[0]], &un_opts, false);
+    }
+    // batch: one summary + one confirmation, then run each uninstaller
+    let total: u64 = picked.iter().filter_map(|&i| apps[i].size_bytes).sum();
+    println!(
+        "{}  {} apps · {}",
+        style.bold("Uninstall"),
+        picked.len(),
+        style.cyan(&fmt_size(total))
+    );
+    for &i in &picked {
+        let size = apps[i]
+            .size_bytes
+            .map(fmt_size)
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "  {} {:>10}  {}",
+            pad_to_width(&truncate(&apps[i].name, 44), 44),
+            size,
+            style.dim(apps[i].source.label())
+        );
+    }
+    if !crate::ui::confirm(&format!("\nUninstall these {} apps?", picked.len())) {
+        println!("Aborted, nothing was uninstalled.");
+        return ExitCode::SUCCESS;
+    }
+    println!();
+    let mut failed = 0usize;
+    for &i in &picked {
+        // batch confirmation already given: skip the per-app prompt but
+        // keep the leftover-sweep prompts (opts.yes stays false)
+        if crate::uninstall::uninstall_app(&apps[i], &un_opts, true) != ExitCode::SUCCESS {
+            failed += 1;
+        }
+        println!();
+    }
+    if failed > 0 {
+        eprintln!("{failed} of {} uninstalls reported problems", picked.len());
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
+}
+
+/// Selection key that survives re-sorting.
+fn entry_key(app: &AppEntry) -> String {
+    format!("{}|{}", app.name, app.location)
+}
+
+/// Cursor loop inside the alternate screen. Space toggles selection with
+/// instant feedback (LazyVim-style hint in the footer) and advances the
+/// cursor; Enter returns the selection — or just the highlighted row when
+/// nothing is marked. Empty result = quit. Sizes missing from the
+/// registry are computed when a row is first highlighted: the frame
+/// renders first (with a "computing" hint), then the walk runs, the list
+/// re-sorts and the cursor follows the entry.
+fn pick_apps(apps: &mut [AppEntry], style: &Style) -> Vec<usize> {
+    if apps.is_empty() {
+        return Vec::new();
+    }
+    let mut stdin = std::io::stdin().lock();
+    let mut cursor = 0usize;
+    let mut offset = 0usize;
+    let mut selected: HashSet<String> = HashSet::new();
+    let mut message = String::new();
+    // keyed by location: survives re-sorting, prevents endless re-walks
+    let mut size_attempted: HashSet<String> = HashSet::new();
+    loop {
+        let viewport = term::term_rows().saturating_sub(7).clamp(3, 500);
+        cursor = cursor.min(apps.len() - 1);
+        if cursor < offset {
+            offset = cursor;
+        }
+        if cursor >= offset + viewport {
+            offset = cursor + 1 - viewport;
+        }
+        let sel = &apps[cursor];
+        let needs_size = sel.size_bytes.is_none()
+            && !sel.location.is_empty()
+            && location_computable(&sel.location)
+            && !size_attempted.contains(&sel.location);
+        draw_picker(
+            apps, style, cursor, offset, viewport, needs_size, &selected, &message,
+        );
+        if needs_size {
+            // frame already shows the hint; now do the blocking walk
+            let location = apps[cursor].location.clone();
+            size_attempted.insert(location.clone());
+            let path = Path::new(&location);
+            if path.symlink_metadata().is_ok() {
+                apps[cursor].size_bytes = Some(crate::scan::entry_size(path));
+                // keep the "biggest first" contract honest: re-sort and
+                // let the cursor follow the entry it was on
+                sort_apps(apps);
+                cursor = apps
+                    .iter()
+                    .position(|a| a.location == location)
+                    .unwrap_or(cursor);
+            }
+            continue; // redraw with the real size before reading keys
+        }
+        message.clear();
+        match term::read_key(&mut stdin) {
+            Key::Quit => return Vec::new(),
+            Key::Down => cursor = (cursor + 1).min(apps.len() - 1),
+            Key::Up => cursor = cursor.saturating_sub(1),
+            Key::PageDown => cursor = (cursor + viewport).min(apps.len() - 1),
+            Key::PageUp => cursor = cursor.saturating_sub(viewport),
+            Key::Top => cursor = 0,
+            Key::Bottom => cursor = apps.len() - 1,
+            Key::Space => {
+                // toggle + instant feedback, then advance (fzf-style)
+                let key = entry_key(&apps[cursor]);
+                if selected.remove(&key) {
+                    message = format!("○ unselected {}", apps[cursor].name);
+                } else {
+                    selected.insert(key);
+                    message = format!("● selected {}", apps[cursor].name);
+                }
+                if !selected.is_empty() {
+                    let total: u64 = apps
+                        .iter()
+                        .filter(|a| selected.contains(&entry_key(a)))
+                        .filter_map(|a| a.size_bytes)
+                        .sum();
+                    message.push_str(&format!(
+                        " — {} marked, {}",
+                        selected.len(),
+                        fmt_size(total)
+                    ));
+                }
+                cursor = (cursor + 1).min(apps.len() - 1);
+            }
+            Key::Enter | Key::Right => {
+                if selected.is_empty() {
+                    return vec![cursor];
+                }
+                return apps
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, a)| selected.contains(&entry_key(a)))
+                    .map(|(i, _)| i)
+                    .collect();
+            }
+            Key::Left | Key::Other => {}
+        }
+    }
+}
+
+/// Guard against vendors writing overly broad InstallLocation values
+/// (e.g. `C:\Program Files` itself): require at least two path segments
+/// below the root before we agree to walk it.
+fn location_computable(location: &str) -> bool {
+    Path::new(location)
+        .components()
+        .filter(|c| matches!(c, std::path::Component::Normal(_)))
+        .count()
+        >= 2
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_picker(
+    apps: &[AppEntry],
+    style: &Style,
+    cursor: usize,
+    offset: usize,
+    viewport: usize,
+    computing: bool,
+    selected: &HashSet<String>,
+    message: &str,
+) {
+    let mut out = String::from("\x1b[H\x1b[2J");
+    let total: u64 = apps.iter().filter_map(|a| a.size_bytes).sum();
+    let hint = if selected.is_empty() {
+        "j/k move · Space select · Enter uninstall · g/G jump · q quit".to_string()
+    } else {
+        format!(
+            "{} marked · Enter uninstalls them · Space toggle · q quit",
+            selected.len()
+        )
+    };
+    out.push_str(&format!(
+        "{}  {}\r\n{}\r\n\r\n",
+        style.bold("Apps"),
+        style.dim(&format!("{} apps · {}", apps.len(), fmt_size(total))),
+        style.dim(&hint)
+    ));
+    for (i, app) in apps.iter().enumerate().skip(offset).take(viewport) {
+        let size = if i == cursor && computing {
+            "…".to_string()
+        } else {
+            app.size_bytes
+                .map(fmt_size)
+                .unwrap_or_else(|| "-".to_string())
+        };
+        let is_marked = selected.contains(&entry_key(app));
+        let mark = if is_marked { "●" } else { " " };
+        let line = format!(
+            "{mark} {} {} {:>10}  {}",
+            pad_to_width(&truncate(&app.name, 44), 44),
+            pad_to_width(&truncate(&app.version, 14), 14),
+            size,
+            app.source.label()
+        );
+        if i == cursor {
+            out.push_str(&style.invert(&format!(" ❯ {line}")));
+            out.push_str("\r\n");
+        } else if is_marked {
+            out.push_str(&format!("   {}\r\n", style.cyan(&line)));
+        } else {
+            out.push_str(&format!("   {line}\r\n"));
+        }
+    }
+    if offset + viewport < apps.len() {
+        out.push_str(&style.dim(&format!("   … {}/{} shown", offset + viewport, apps.len())));
+        out.push_str("\r\n");
+    }
+    // footer: everything we know about the highlighted app
+    let sel = &apps[cursor];
+    out.push_str("\r\n");
+    if !sel.location.is_empty() {
+        out.push_str(&format!(
+            "{}\r\n",
+            style.dim(&format!("location  {}", truncate(&sel.location, 100)))
+        ));
+    }
+    if computing {
+        out.push_str(&format!("{}\r\n", style.dim("computing size…")));
+    }
+    if !message.is_empty() {
+        out.push_str(&format!("{}\r\n", style.yellow(message)));
+    }
+    let mut meta = Vec::new();
+    if !sel.publisher.is_empty() {
+        meta.push(sel.publisher.clone());
+    }
+    if let Some(date) = &sel.install_date {
+        meta.push(format!("installed {date}"));
+    }
+    if !meta.is_empty() {
+        out.push_str(&format!("{}\r\n", style.dim(&meta.join(" · "))));
+    }
+    print!("{out}");
+    let _ = std::io::stdout().flush();
+}
 
 fn print_table(apps: &[AppEntry], style: &Style) {
     println!(
@@ -354,9 +641,9 @@ fn print_table(apps: &[AppEntry], style: &Style) {
             .unwrap_or_else(|| "-".to_string());
         let date = app.install_date.as_deref().unwrap_or("-");
         println!(
-            "  {:<42} {:<16} {:>10}  {:<10} {}",
-            truncate(&app.name, 42),
-            truncate(&app.version, 16),
+            "  {} {} {:>10}  {:<10} {}",
+            pad_to_width(&truncate(&app.name, 42), 42),
+            pad_to_width(&truncate(&app.version, 16), 16),
             size,
             date,
             style.dim(app.source.label())
@@ -377,12 +664,10 @@ fn print_table(apps: &[AppEntry], style: &Style) {
     println!("\n{}", style.dim(&summary.join(" · ")));
 }
 
+/// Width-aware truncation (CJK chars count as 2 cells); shared with the
+/// uninstall candidate list and ctxmenu output.
 pub fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let cut: String = s.chars().take(max.saturating_sub(1)).collect();
-    format!("{cut}…")
+    truncate_width(s, max)
 }
 
 fn print_json(apps: &[AppEntry]) {
@@ -414,6 +699,7 @@ fn print_json(apps: &[AppEntry]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::display_width;
 
     fn entry(name: &str, size: Option<u64>, date: Option<&str>) -> AppEntry {
         AppEntry {
@@ -462,6 +748,24 @@ mod tests {
     }
 
     #[test]
+    fn steam_merge_replaces_only_games_with_matching_manifests() {
+        let mut registry = vec![
+            entry("Steam App 570", None, None),
+            entry("Steam App 730", None, None),
+        ];
+        registry[0].uninstall_string = "steam://uninstall/570".into();
+        registry[1].uninstall_string = "steam://uninstall/730".into();
+        let mut replacement = entry("Dota 2", Some(100), None);
+        replacement.uninstall_string = "steam://uninstall/570".into();
+        replacement.source = Source::Steam;
+
+        merge_steam_games(&mut registry, vec![replacement]);
+        let names: Vec<&str> = registry.iter().map(|app| app.name.as_str()).collect();
+
+        assert_eq!(names, vec!["Steam App 730", "Dota 2"]);
+    }
+
+    #[test]
     fn portable_scan_detects_exe_dirs() {
         let root = std::env::temp_dir().join(format!("dpan-apps-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -488,5 +792,8 @@ mod tests {
         assert_eq!(truncate("short", 10), "short");
         assert_eq!(truncate("exactly-10", 10), "exactly-10");
         assert_eq!(truncate("this is far too long", 10), "this is f…");
+        // CJK: 10 cells max -> 4 wide chars (8) + ellipsis (1) = 9 cells
+        assert_eq!(truncate("上传到百度网盘助手", 10), "上传到百…");
+        assert!(display_width(&truncate("上传到百度网盘助手", 10)) <= 10);
     }
 }

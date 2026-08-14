@@ -20,7 +20,6 @@ pub struct AnalyzeOptions {
     pub path: Option<PathBuf>,
     pub json: bool,
     pub top: usize,
-    pub no_color: bool,
 }
 
 impl Default for AnalyzeOptions {
@@ -29,7 +28,6 @@ impl Default for AnalyzeOptions {
             path: None,
             json: false,
             top: 40,
-            no_color: false,
         }
     }
 }
@@ -51,7 +49,7 @@ pub fn run(opts: &AnalyzeOptions) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let style = Style::auto(opts.no_color);
+    let style = Style::auto();
     let progress = !opts.json && io::stderr().is_terminal();
     let scan = scan_tree(&root, progress);
 
@@ -255,7 +253,7 @@ fn explore(root: &Path, scan: &ScanResult, style: &Style, top: usize) {
 /// Full-screen cursor browser: j/k move, l/Enter open, h up, g/G jump,
 /// q/ESC quit. Every keypress redraws immediately — no Enter needed.
 fn browse(root: &Path, scan: &ScanResult, style: &Style, top: usize, _raw: RawMode) {
-    let _screen = AltScreen::enter();
+    let _screen = term::AltScreen::enter();
     let mut stdin = io::stdin().lock();
     let mut cur = root.to_path_buf();
     let mut entries = list_entries(&cur, scan);
@@ -310,26 +308,8 @@ fn browse(root: &Path, scan: &ScanResult, style: &Style, top: usize, _raw: RawMo
                     message = "already at the scanned root".into();
                 }
             }
-            Key::Other => {}
+            Key::Space | Key::Other => {}
         }
-    }
-}
-
-/// RAII alternate-screen guard (mole's tput smcup/rmcup equivalent).
-struct AltScreen;
-
-impl AltScreen {
-    fn enter() -> AltScreen {
-        print!("\x1b[?1049h\x1b[?25l"); // alt screen + hide cursor
-        let _ = io::stdout().flush();
-        AltScreen
-    }
-}
-
-impl Drop for AltScreen {
-    fn drop(&mut self) {
-        print!("\x1b[?25h\x1b[?1049l"); // show cursor + restore screen
-        let _ = io::stdout().flush();
     }
 }
 

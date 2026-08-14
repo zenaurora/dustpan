@@ -71,6 +71,15 @@ impl Safety {
         }
     }
 
+    /// Extend this safety instance with purpose-specific roots. Denied system
+    /// trees, protected roots, minimum depth, and the user whitelist still
+    /// apply. The extension is instance-local so cache cleaning keeps its
+    /// original fail-closed allowlist.
+    pub fn with_extra_allowed_bases(mut self, bases: &[PathBuf]) -> Safety {
+        self.allowed_bases.extend(bases.iter().cloned());
+        self
+    }
+
     #[cfg(test)]
     pub fn for_test(allowed_bases: Vec<PathBuf>, whitelist: Vec<String>) -> Safety {
         Safety {
@@ -223,6 +232,21 @@ mod tests {
     fn fail_closed_without_bases() {
         let s = Safety::for_test(vec![], vec![]);
         assert!(s.check(&base().join("pip").join("cache")).is_err());
+    }
+
+    #[test]
+    fn instance_can_allow_an_extra_base_without_weakening_other_instances() {
+        let extra = if cfg!(windows) {
+            PathBuf::from("D:\\PortableApps")
+        } else {
+            PathBuf::from("/opt/portable-apps")
+        };
+        let app = extra.join("UsefulTool");
+        let regular = Safety::for_test(vec![base()], vec![]);
+        assert!(regular.check(&app).is_err());
+
+        let extended = regular.with_extra_allowed_bases(&[extra]);
+        assert!(extended.check(&app).is_ok());
     }
 
     #[test]

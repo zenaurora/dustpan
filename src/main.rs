@@ -12,6 +12,7 @@ mod ctxmenu;
 mod reg;
 mod safety;
 mod scan;
+mod steam;
 mod targets;
 mod term;
 mod ui;
@@ -31,7 +32,6 @@ struct Options {
     dry_run: bool,
     yes: bool,
     verbose: bool,
-    no_color: bool,
     list: bool,
     recycle_bin: bool,
     only: Option<Vec<Category>>,
@@ -83,7 +83,6 @@ fn parse_ctxmenu_args(args: &[String]) -> Result<Option<Cli>, String> {
     let mut action = ctxmenu::Action::List;
     let mut filter: Option<String> = None;
     let mut json = false;
-    let mut no_color = false;
     let mut rest = args;
     if let Some(first) = rest.first() {
         match first.as_str() {
@@ -101,7 +100,6 @@ fn parse_ctxmenu_args(args: &[String]) -> Result<Option<Cli>, String> {
     for arg in rest {
         match arg.as_str() {
             "--json" => json = true,
-            "--no-color" => no_color = true,
             "-h" | "--help" => {
                 print_help();
                 return Ok(None);
@@ -122,7 +120,6 @@ fn parse_ctxmenu_args(args: &[String]) -> Result<Option<Cli>, String> {
         action,
         filter,
         json,
-        no_color,
     })))
 }
 
@@ -130,12 +127,10 @@ fn parse_uninstall_args(args: &[String]) -> Result<Option<Cli>, String> {
     let mut filter: Option<String> = None;
     let mut dry_run = false;
     let mut yes = false;
-    let mut no_color = false;
     for arg in args {
         match arg.as_str() {
             "-n" | "--dry-run" => dry_run = true,
             "-y" | "--yes" => yes = true,
-            "--no-color" => no_color = true,
             "-h" | "--help" => {
                 print_help();
                 return Ok(None);
@@ -154,7 +149,6 @@ fn parse_uninstall_args(args: &[String]) -> Result<Option<Cli>, String> {
         filter,
         dry_run,
         yes,
-        no_color,
     })))
 }
 
@@ -163,7 +157,6 @@ fn parse_apps_args(args: &[String]) -> Result<Option<Cli>, String> {
     for arg in args {
         match arg.as_str() {
             "--json" => opts.json = true,
-            "--no-color" => opts.no_color = true,
             "-h" | "--help" => {
                 print_help();
                 return Ok(None);
@@ -186,7 +179,6 @@ fn parse_analyze_args(args: &[String]) -> Result<Option<Cli>, String> {
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--json" => opts.json = true,
-            "--no-color" => opts.no_color = true,
             "--top" => {
                 let value = iter.next().ok_or("--top needs a number")?;
                 opts.top = value
@@ -224,7 +216,6 @@ fn parse_clean_args(args: &[String]) -> Result<Option<Cli>, String> {
             "-n" | "--dry-run" => opts.dry_run = true,
             "-y" | "--yes" => opts.yes = true,
             "-v" | "--verbose" => opts.verbose = true,
-            "--no-color" => opts.no_color = true,
             "--list" => opts.list = true,
             "--recycle-bin" => opts.recycle_bin = true,
             "-V" | "--version" => {
@@ -290,10 +281,13 @@ ANALYZE OPTIONS (read-only disk usage explorer):
         --json           Print sizes as JSON and exit (for scripting)
         --top <n>        Entries shown per directory (default: 40)
 
-APPS OPTIONS (installed application inventory, biggest first):
+APPS OPTIONS (interactive app list, biggest first):
     [FILTER]             Only show apps whose name contains FILTER
         --json           Print the inventory as JSON (adds publisher,
                          location, uninstall string)
+    Interactive keys: j/k move, Space multi-select (with live hint),
+    Enter uninstalls marked apps (or the highlighted one), g/G jump, q quit;
+    sources: registry, Steam libraries (ACF manifests), portable dirs.
 
 UNINSTALL OPTIONS (runs the vendor uninstaller, then sweeps leftovers):
     <FILTER>             App to uninstall (must match exactly one)
@@ -307,7 +301,6 @@ CTXMENU OPTIONS (right-click menu manager, no admin needed):
         --json                   List as JSON
 
 COMMON OPTIONS:
-        --no-color       Disable colored output
     -h, --help           Show this help
     -V, --version        Show version
 
@@ -319,7 +312,7 @@ FILES:
 }
 
 fn run(opts: &Options) -> ExitCode {
-    let style = Style::auto(opts.no_color);
+    let style = Style::auto();
     let resolved = targets::resolve_targets(opts.only.as_deref());
 
     if resolved.is_empty() {
