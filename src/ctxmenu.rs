@@ -12,8 +12,10 @@
 //! Vendor keys are never deleted; `on` reverses everything. dustpan's
 //! registry writes stay strictly inside HKCU.
 
+use std::io::{self, IsTerminal, Write};
 use std::process::ExitCode;
 
+use crate::term::{self, Key, RawMode};
 use crate::ui::Style;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -221,6 +223,137 @@ pub fn run(opts: &CtxOptions) -> ExitCode {
             }
         }
     }
+}
+
+/// Interactive context-menu browser used by the no-argument entry point.
+/// Enter/Space toggles the highlighted entry; all registry writes still go
+/// through the existing HKCU-only `disable`/`enable` implementation.
+pub fn interactive() -> ExitCode {
+    if !cfg!(windows) {
+        println!("context-menu management is only available on Windows");
+        return ExitCode::SUCCESS;
+    }
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        eprintln!("context-menu management needs an interactive terminal");
+        return ExitCode::FAILURE;
+    }
+    let mut entries = collect();
+    if entries.is_empty() {
+        println!("No context-menu entries found.");
+        return ExitCode::SUCCESS;
+    }
+    let Some(raw) = RawMode::enter() else {
+        return ExitCode::FAILURE;
+    };
+    let screen = crate::term::AltScreen::enter();
+    let style = Style::auto();
+    let mut cursor = 0usize;
+    let mut offset = 0usize;
+    let mut message = String::new();
+    let mut stdin = io::stdin().lock();
+    loop {
+        let viewport = term::term_rows().saturating_sub(6).max(3);
+        cursor = cursor.min(entries.len() - 1);
+        if cursor < offset {
+            offset = cursor;
+        }
+        if cursor >= offset + viewport {
+            offset = cursor + 1 - viewport;
+        }
+        draw_interactive(&entries, cursor, offset, viewport, &style, &message);
+        message.clear();
+        match term::read_key(&mut stdin) {
+            Key::Up => cursor = cursor.saturating_sub(1),
+            Key::Down => cursor = (cursor + 1).min(entries.len() - 1),
+            Key::Top => cursor = 0,
+            Key::Bottom => cursor = entries.len() - 1,
+            Key::PageUp => cursor = cursor.saturating_sub(viewport),
+            Key::PageDown => cursor = (cursor + viewport).min(entries.len() - 1),
+            Key::Enter | Key::Space => {
+                let was_disabled = entries[cursor].disabled;
+                if !was_disabled && entries[cursor].is_windows_builtin() {
+                    message = format!(
+                        "refusing to disable Windows entry: {}",
+                        entries[cursor].text
+                    );
+                    continue;
+                }
+                let ok = if was_disabled {
+                    enable(&entries[cursor])
+                } else {
+                    disable(&entries[cursor])
+                };
+                if ok {
+                    entries[cursor].disabled = !was_disabled;
+                    message = if was_disabled {
+                        format!("restored {}", entries[cursor].text)
+                    } else {
+                        format!("disabled {}", entries[cursor].text)
+                    };
+                } else {
+                    message = "registry update failed".into();
+                }
+            }
+            Key::Quit | Key::Left => {
+                drop(screen);
+                drop(raw);
+                return ExitCode::SUCCESS;
+            }
+            Key::Right | Key::Other | Key::Number(_) => {}
+        }
+    }
+}
+
+fn draw_interactive(
+    entries: &[MenuEntry],
+    cursor: usize,
+    offset: usize,
+    viewport: usize,
+    style: &Style,
+    message: &str,
+) {
+    let mut out = String::from("\x1b[H\x1b[2J\n");
+    out.push_str(&format!("  {}\n", style.bold("Context menu")));
+    out.push_str(&format!(
+        "  {}\n\n",
+        style.dim("Enter/Space toggles the highlighted entry")
+    ));
+    for (i, entry) in entries.iter().enumerate().skip(offset).take(viewport) {
+        let status = if entry.disabled { "off" } else { "on" };
+        let row = format!(
+            "  {:<3} {:<4} {:<8} {:<42} {}  ",
+            i + 1,
+            status,
+            entry.kind.label(),
+            crate::apps::truncate(&entry.text, 42),
+            entry.scope.label()
+        );
+        if i == cursor {
+            out.push_str(&format!("  {}\n", style.invert(&row)));
+        } else {
+            out.push_str(&format!("{row}\n"));
+        }
+    }
+    if offset + viewport < entries.len() {
+        out.push_str(&format!(
+            "\n  {}\n",
+            style.dim(&format!(
+                "showing {}-{} of {}",
+                offset + 1,
+                (offset + viewport).min(entries.len()),
+                entries.len()
+            ))
+        ));
+    }
+    out.push_str(&format!(
+        "\n  {}\n",
+        style.dim("↑↓/j/k move  •  Enter toggle  •  q back")
+    ));
+    if !message.is_empty() {
+        out.push_str(&format!("\n  {}\n", style.yellow(message)));
+    }
+    print!("{out}");
+    let _ = io::stdout().flush();
 }
 
 // ---------------------------------------------------------------------------

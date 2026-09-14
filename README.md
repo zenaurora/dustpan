@@ -11,8 +11,10 @@ Windows `clean`（缓存清理）+ `analyze`（磁盘占用浏览）的 CLI。
 
 ## 用法
 
+直接运行 `dpan` 就可以完成日常操作，不需要记住参数：
+
 ```console
-dpan                     # 进入交互菜单，选择清理 / 应用 / 分析 / 右键菜单
+dpan                     # 交互菜单（推荐）
 dpan clean               # 扫描 → 预览 → 确认 → 清理
 dpan clean --dry-run     # 只看能清多少，不删
 dpan clean --only dev,browser  # 限定类别：temp / system / browser / dev / apps
@@ -36,6 +38,15 @@ dpan ctxmenu              # 列出所有右键菜单项（含来源 DLL/命令�
 dpan ctxmenu off 百度     # 隐藏某项（可逆，不删厂商键，免管理员）
 dpan ctxmenu on 百度      # 恢复
 ```
+
+无参数菜单里的常用流程：
+
+- **Clean**：先选择临时文件、系统缓存、浏览器缓存、开发缓存、应用缓存和回收站，再扫描、预览、确认。
+- **Apps**：直接浏览应用并按 Enter 卸载，空格可以多选。
+- **Analyze**：选择 Home、Desktop、Downloads、Documents 或 Pictures 后进入磁盘占用浏览。
+- **Context Menu**：直接浏览右键菜单项，Enter/空格切换启用状态。
+
+命令行参数保留给脚本、自动化和少数高级操作；普通用户只运行 `dpan` 即可。
 
 ## analyze（只读磁盘占用浏览）
 

@@ -93,14 +93,23 @@ fn parse_args() -> Result<Option<Cli>, String> {
 
 fn run_menu() -> ExitCode {
     match menu::choose() {
-        Some(menu::Action::Clean) => run(&Options::default()),
+        Some(menu::Action::Clean) => match menu::choose_clean() {
+            Some(selection) => run(&Options {
+                recycle_bin: selection.recycle_bin,
+                only: selection.only,
+                ..Options::default()
+            }),
+            None => ExitCode::SUCCESS,
+        },
         Some(menu::Action::Apps) => apps::run(&apps::AppsOptions::default()),
-        Some(menu::Action::Analyze) => analyze::run(&analyze::AnalyzeOptions::default()),
-        Some(menu::Action::Ctxmenu) => ctxmenu::run(&ctxmenu::CtxOptions {
-            action: ctxmenu::Action::List,
-            filter: None,
-            json: false,
-        }),
+        Some(menu::Action::Analyze) => match menu::choose_analyze() {
+            Some(selection) => analyze::run(&analyze::AnalyzeOptions {
+                path: Some(selection.path),
+                ..analyze::AnalyzeOptions::default()
+            }),
+            None => ExitCode::SUCCESS,
+        },
+        Some(menu::Action::Ctxmenu) => ctxmenu::interactive(),
         None => ExitCode::SUCCESS,
     }
 }
@@ -288,7 +297,7 @@ fn print_help() {
         "dpan {VERSION} — lightweight Windows cache cleaner
 
 USAGE:
-    dpan                         Open the interactive menu
+    dpan                         Open the interactive menu (recommended)
     dpan clean [OPTIONS]
     dpan analyze [PATH] [OPTIONS]
     dpan apps [FILTER] [OPTIONS]
@@ -302,11 +311,13 @@ CLEAN OPTIONS:
         --list           List resolved targets without scanning sizes
         --recycle-bin    Also empty the Recycle Bin (Windows only)
     -v, --verbose        Show per-entry decisions (skips, failures)
+    When started without arguments, Clean opens a category picker first.
 
 ANALYZE OPTIONS (read-only disk usage explorer):
     [PATH]               Directory to analyze (default: home directory)
         --json           Print sizes as JSON and exit (for scripting)
         --top <n>        Entries shown per directory (default: 40)
+    Without arguments, Analyze offers Home/Desktop/Downloads/Documents first.
 
 APPS OPTIONS (interactive app list, biggest first):
     [FILTER]             Only show apps whose name contains FILTER
@@ -326,6 +337,7 @@ CTXMENU OPTIONS (right-click menu manager, no admin needed):
     dpan ctxmenu off <name>      Hide an entry (reversible, HKCU only)
     dpan ctxmenu on <name>       Restore a hidden entry
         --json                   List as JSON
+    Without arguments, Context Menu opens a keyboard-driven on/off browser.
 
 COMMON OPTIONS:
     -h, --help           Show this help
