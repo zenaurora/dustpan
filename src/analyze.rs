@@ -13,6 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use crate::clean::iso_from_unix;
+use crate::fsutil::is_link_or_reparse;
 use crate::term::{self, Key, RawMode};
 use crate::ui::{fmt_count, fmt_size, Style};
 
@@ -91,8 +92,10 @@ pub fn scan_tree(root: &Path, progress: bool) -> ScanResult {
     let mut root_file_bytes = 0u64;
     if let Ok(rd) = fs::read_dir(root) {
         for e in rd.flatten() {
-            let Ok(meta) = e.metadata() else { continue };
-            if meta.is_symlink() {
+            let Ok(meta) = e.path().symlink_metadata() else {
+                continue;
+            };
+            if is_link_or_reparse(&meta) {
                 continue;
             }
             if meta.is_dir() {
@@ -173,8 +176,10 @@ fn walk(
     let mut total = 0u64;
     if let Ok(rd) = fs::read_dir(dir) {
         for e in rd.flatten() {
-            let Ok(meta) = e.metadata() else { continue };
-            if meta.is_symlink() {
+            let Ok(meta) = e.path().symlink_metadata() else {
+                continue;
+            };
+            if is_link_or_reparse(&meta) {
                 continue;
             }
             if meta.is_dir() {
@@ -206,8 +211,10 @@ fn list_entries(dir: &Path, scan: &ScanResult) -> Vec<Entry> {
     let mut entries = Vec::new();
     if let Ok(rd) = fs::read_dir(dir) {
         for e in rd.flatten() {
-            let Ok(meta) = e.metadata() else { continue };
-            if meta.is_symlink() {
+            let Ok(meta) = e.path().symlink_metadata() else {
+                continue;
+            };
+            if is_link_or_reparse(&meta) {
                 continue;
             }
             let path = e.path();
@@ -316,7 +323,7 @@ fn browse(root: &Path, scan: &ScanResult, style: &Style, top: usize, _raw: RawMo
 fn file_info(entry: &Entry) -> String {
     let modified = entry
         .path
-        .metadata()
+        .symlink_metadata()
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())

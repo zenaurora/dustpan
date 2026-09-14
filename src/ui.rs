@@ -9,7 +9,7 @@ pub struct Style {
 impl Style {
     pub fn auto() -> Style {
         Style {
-            on: crate::term::enable_color(),
+            on: std::env::var_os("DPAN_NO_COLOR").is_none() && crate::term::enable_color(),
         }
     }
 

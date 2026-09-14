@@ -8,6 +8,7 @@ use std::env;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+use crate::fsutil::is_reparse_point;
 use crate::targets::wildcard_match;
 
 pub struct Safety {
@@ -114,6 +115,18 @@ impl Safety {
         for tree in &self.denied_trees {
             if path_starts_with(path, tree) {
                 return Err("inside a protected system tree");
+            }
+        }
+        // A normal-looking child can still resolve outside the allowlist when
+        // one of its parents is a junction or another reparse point. Direct
+        // deletion of the link itself remains allowed; only traversal through
+        // a link is rejected here.
+        for ancestor in path.ancestors().skip(1) {
+            if ancestor
+                .symlink_metadata()
+                .is_ok_and(|meta| is_reparse_point(&meta))
+            {
+                return Err("path crosses a reparse point");
             }
         }
         // Fail closed: no allowed bases means nothing is deletable.

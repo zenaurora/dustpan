@@ -6,6 +6,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::fsutil::is_link_or_reparse;
 use crate::safety::Safety;
 use crate::scan::entry_size;
 use crate::targets::{Mode, ResolvedTarget};
@@ -21,7 +22,7 @@ pub struct CleanStats {
 }
 
 impl CleanStats {
-    fn merge(&mut self, other: &CleanStats) {
+    pub fn merge(&mut self, other: &CleanStats) {
         self.freed += other.freed;
         self.deleted += other.deleted;
         self.failed += other.failed;
@@ -54,13 +55,30 @@ impl<'a> Cleaner<'a> {
                 stats.merge(&s);
             }
             Mode::Contents => {
+                if target
+                    .path
+                    .symlink_metadata()
+                    .is_ok_and(|meta| is_link_or_reparse(&meta))
+                {
+                    stats.skipped += 1;
+                    self.verbose_lines.push(format!(
+                        "skip (target is a reparse point): {}",
+                        target.path.display()
+                    ));
+                    return stats;
+                }
                 let Ok(entries) = fs::read_dir(&target.path) else {
                     stats.failed += 1;
                     return stats;
                 };
-                for entry in entries.flatten() {
-                    let s = self.remove_one(&entry.path());
-                    stats.merge(&s);
+                for entry in entries {
+                    match entry {
+                        Ok(entry) => {
+                            let s = self.remove_one(&entry.path());
+                            stats.merge(&s);
+                        }
+                        Err(_) => stats.failed += 1,
+                    }
                 }
             }
         }
@@ -116,8 +134,9 @@ impl<'a> Cleaner<'a> {
 
 fn remove_entry(path: &Path) -> std::io::Result<()> {
     let meta = path.symlink_metadata()?;
-    if meta.is_symlink() {
-        // On Windows a directory symlink needs remove_dir.
+    if is_link_or_reparse(&meta) {
+        // Never recurse through a symlink, junction, or other reparse point.
+        // Directory links are removed as links, not as their targets.
         fs::remove_file(path).or_else(|_| fs::remove_dir(path))
     } else if meta.is_dir() {
         fs::remove_dir_all(path)

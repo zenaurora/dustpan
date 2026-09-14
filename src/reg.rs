@@ -17,6 +17,7 @@ pub const HKLM: isize = 0x8000_0002u32 as i32 as isize;
 const KEY_READ: u32 = 0x2_0019;
 const KEY_READ_WRITE: u32 = 0x2_001F;
 const ERROR_SUCCESS: i32 = 0;
+const ERROR_MORE_DATA: i32 = 234;
 const ERROR_NO_MORE_ITEMS: i32 = 259;
 const REG_SZ: u32 = 1;
 const REG_EXPAND_SZ: u32 = 2;
@@ -177,22 +178,45 @@ impl Key {
     /// Read a REG_SZ/REG_EXPAND_SZ value; empty name reads the default value.
     pub fn string_value(&self, name: &str) -> String {
         let mut ty = 0u32;
-        let mut buf = vec![0u8; 8192];
-        let mut len = buf.len() as u32;
+        let value_name = wide(name);
+        let mut len = 0u32;
         let rc = unsafe {
             RegQueryValueExW(
                 self.0,
-                wide(name).as_ptr(),
+                value_name.as_ptr(),
                 std::ptr::null_mut(),
                 &mut ty,
-                buf.as_mut_ptr(),
+                std::ptr::null_mut(),
                 &mut len,
             )
         };
-        if rc != ERROR_SUCCESS || (ty != REG_SZ && ty != REG_EXPAND_SZ) {
+        if rc != ERROR_SUCCESS || (ty != REG_SZ && ty != REG_EXPAND_SZ) || len == 0 {
             return String::new();
         }
-        let units: Vec<u16> = buf[..len as usize]
+        let mut buf = vec![0u8; len as usize];
+        loop {
+            len = buf.len() as u32;
+            let rc = unsafe {
+                RegQueryValueExW(
+                    self.0,
+                    value_name.as_ptr(),
+                    std::ptr::null_mut(),
+                    &mut ty,
+                    buf.as_mut_ptr(),
+                    &mut len,
+                )
+            };
+            if rc == ERROR_MORE_DATA {
+                buf.resize(len as usize, 0);
+                continue;
+            }
+            if rc != ERROR_SUCCESS {
+                return String::new();
+            }
+            buf.truncate(len as usize);
+            break;
+        }
+        let units: Vec<u16> = buf
             .chunks_exact(2)
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();

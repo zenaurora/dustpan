@@ -5,8 +5,11 @@
 //! against the current environment and filesystem. A template whose env var
 //! is missing simply yields no targets, which keeps the table portable.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use crate::fsutil::is_link_or_reparse;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Category {
@@ -330,6 +333,7 @@ pub struct ResolvedTarget {
 
 pub fn resolve_targets(only: Option<&[Category]>) -> Vec<ResolvedTarget> {
     let mut out = Vec::new();
+    let mut seen = HashSet::new();
     for spec in TARGETS {
         if let Some(filter) = only {
             if !filter.contains(&spec.category) {
@@ -337,7 +341,8 @@ pub fn resolve_targets(only: Option<&[Category]>) -> Vec<ResolvedTarget> {
             }
         }
         for path in expand_template(spec.template, &|v| std::env::var(v).ok()) {
-            if path.symlink_metadata().is_ok() {
+            let key = path.to_string_lossy().replace('/', "\\").to_lowercase();
+            if path.symlink_metadata().is_ok() && seen.insert(key) {
                 out.push(ResolvedTarget {
                     category: spec.category,
                     name: spec.name,
@@ -405,7 +410,15 @@ fn walk_wildcards(dir: &Path, segs: &[&str], results: &mut Vec<PathBuf>) {
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         if wildcard_match(first, &name) {
-            walk_wildcards(&dir.join(&name), rest, results);
+            let path = dir.join(&name);
+            // A wildcard can otherwise walk through a junction into an
+            // unrelated tree before the deletion safety gate sees it.
+            if let Ok(meta) = path.symlink_metadata() {
+                if !rest.is_empty() && is_link_or_reparse(&meta) {
+                    continue;
+                }
+            }
+            walk_wildcards(&path, rest, results);
         }
     }
 }

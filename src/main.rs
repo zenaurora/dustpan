@@ -8,6 +8,7 @@ mod analyze;
 mod apps;
 mod clean;
 mod ctxmenu;
+mod fsutil;
 mod menu;
 #[cfg(windows)]
 mod reg;
@@ -64,7 +65,12 @@ enum Cli {
 }
 
 fn parse_args() -> Result<Option<Cli>, String> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let no_color = args.iter().any(|arg| arg == "--no-color");
+    args.retain(|arg| arg != "--no-color");
+    if no_color {
+        std::env::set_var("DPAN_NO_COLOR", "1");
+    }
     if args.is_empty() {
         return Ok(Some(Cli::Menu));
     }
@@ -324,6 +330,7 @@ CTXMENU OPTIONS (right-click menu manager, no admin needed):
 COMMON OPTIONS:
     -h, --help           Show this help
     -V, --version        Show version
+        --no-color       Disable ANSI color output
 
 FILES:
     whitelist       %APPDATA%\\dustpan\\whitelist.txt       (one path/glob per line)
@@ -336,7 +343,7 @@ fn run(opts: &Options) -> ExitCode {
     let style = Style::auto();
     let resolved = targets::resolve_targets(opts.only.as_deref());
 
-    if resolved.is_empty() {
+    if resolved.is_empty() && !opts.recycle_bin {
         println!("No cleanable targets found on this system.");
         if !cfg!(windows) {
             println!(
@@ -386,15 +393,9 @@ fn run(opts: &Options) -> ExitCode {
     let safety = Safety::load();
     let mut cleaner = Cleaner::new(&safety, opts.dry_run);
     let mut stats = CleanStats::default();
-    for (target, size) in resolved.iter().zip(&sizes) {
-        if *size == 0 {
-            continue;
-        }
+    for target in &resolved {
         let s = cleaner.clean_target(target);
-        stats.freed += s.freed;
-        stats.deleted += s.deleted;
-        stats.failed += s.failed;
-        stats.skipped += s.skipped;
+        stats.merge(&s);
     }
 
     if opts.verbose {
@@ -435,10 +436,16 @@ fn run(opts: &Options) -> ExitCode {
         }
     }
 
-    if opts.recycle_bin {
-        empty_recycle_bin(opts.dry_run, &style);
+    let recycle_ok = if opts.recycle_bin {
+        empty_recycle_bin(opts.dry_run, &style)
+    } else {
+        true
+    };
+    if stats.failed > 0 || !recycle_ok {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     }
-    ExitCode::SUCCESS
 }
 
 fn print_target_list(resolved: &[ResolvedTarget], style: &Style) {
@@ -478,28 +485,39 @@ fn print_preview(resolved: &[ResolvedTarget], sizes: &[u64], verbose: bool, styl
     }
 }
 
-/// Lite approach: shell out to PowerShell instead of linking shell32.
-fn empty_recycle_bin(dry_run: bool, style: &Style) {
+/// Empty all recycle bins through the native Shell API.
+fn empty_recycle_bin(dry_run: bool, style: &Style) -> bool {
     if !cfg!(windows) {
         println!(
             "{}",
             style.dim("--recycle-bin is only available on Windows, skipped")
         );
-        return;
+        return true;
     }
     if dry_run {
         println!("{}", style.dim("dry run: would empty the Recycle Bin"));
-        return;
+        return true;
     }
-    let status = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-Command",
-            "Clear-RecycleBin -Force -ErrorAction SilentlyContinue",
-        ])
-        .status();
-    match status {
-        Ok(s) if s.success() => println!("{} Recycle Bin emptied", style.green("✓")),
-        _ => println!("{}", style.yellow("could not empty the Recycle Bin")),
+    #[cfg(windows)]
+    {
+        use std::ptr;
+
+        #[link(name = "shell32")]
+        extern "system" {
+            fn SHEmptyRecycleBinW(
+                hwnd: *mut std::ffi::c_void,
+                root_path: *const u16,
+                flags: u32,
+            ) -> i32;
+        }
+
+        // SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND.
+        let result = unsafe { SHEmptyRecycleBinW(ptr::null_mut(), ptr::null(), 0x7) };
+        if result == 0 {
+            println!("{} Recycle Bin emptied", style.green("✓"));
+            return true;
+        }
     }
+    println!("{}", style.yellow("could not empty the Recycle Bin"));
+    false
 }

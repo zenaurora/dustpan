@@ -12,6 +12,7 @@ use std::process::ExitCode;
 use std::time::UNIX_EPOCH;
 
 use crate::clean::iso_from_unix;
+use crate::fsutil::is_link_or_reparse;
 use crate::term::{self, Key, RawMode};
 use crate::ui::{fmt_size, pad_to_width, truncate_width, Style};
 
@@ -271,19 +272,32 @@ pub(crate) fn portable_roots() -> Vec<PathBuf> {
             );
         }
     }
+    let mut seen = HashSet::new();
+    roots.retain(|root| {
+        root.is_absolute() && seen.insert(norm_path(root.to_string_lossy().as_ref()))
+    });
     roots
 }
 
 fn portable_apps() -> Vec<AppEntry> {
     let mut apps = Vec::new();
     for root in portable_roots() {
+        if root
+            .symlink_metadata()
+            .is_ok_and(|meta| is_link_or_reparse(&meta))
+        {
+            continue;
+        }
         let Ok(rd) = fs::read_dir(&root) else {
             continue;
         };
         let is_scoop = root.ends_with("scoop/apps") || root.ends_with(r"scoop\apps");
         for entry in rd.flatten() {
             let path = entry.path();
-            if !path.is_dir() {
+            let Ok(meta) = path.symlink_metadata() else {
+                continue;
+            };
+            if is_link_or_reparse(&meta) || !meta.is_dir() {
                 continue;
             }
             if !contains_exe(&path, 2) {
@@ -299,7 +313,7 @@ fn portable_apps() -> Vec<AppEntry> {
                 String::new()
             };
             let install_date = path
-                .metadata()
+                .symlink_metadata()
                 .and_then(|m| m.modified())
                 .ok()
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
@@ -329,14 +343,20 @@ fn contains_exe(dir: &Path, depth: u32) -> bool {
     let mut subdirs = Vec::new();
     for entry in rd.flatten() {
         let path = entry.path();
-        if path.is_file() {
+        let Ok(meta) = path.symlink_metadata() else {
+            continue;
+        };
+        if is_link_or_reparse(&meta) {
+            continue;
+        }
+        if meta.is_file() {
             if path
                 .extension()
                 .is_some_and(|e| e.eq_ignore_ascii_case("exe"))
             {
                 return true;
             }
-        } else if depth > 0 && path.is_dir() {
+        } else if depth > 0 && meta.is_dir() {
             subdirs.push(path);
         }
     }
@@ -349,7 +369,11 @@ fn scoop_version(app_dir: &Path) -> Option<String> {
     let mut versions: Vec<String> = fs::read_dir(app_dir)
         .ok()?
         .flatten()
-        .filter(|e| e.path().is_dir())
+        .filter(|e| {
+            e.path()
+                .symlink_metadata()
+                .is_ok_and(|m| !is_link_or_reparse(&m) && m.is_dir())
+        })
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .filter(|n| n != "current")
         .collect();

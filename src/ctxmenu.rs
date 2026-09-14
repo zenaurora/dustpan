@@ -229,6 +229,10 @@ pub fn run(opts: &CtxOptions) -> ExitCode {
 
 #[cfg_attr(not(windows), allow(dead_code))] // used by the Windows disable/enable
 const BLOCKED_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Shell Extensions\Blocked";
+#[cfg(windows)]
+const HANDLER_MARKER_PREFIX: &str = "DustpanManaged:";
+#[cfg(windows)]
+const VERB_MARKER: &str = "DustpanManaged";
 
 #[cfg(windows)]
 fn collect() -> Vec<MenuEntry> {
@@ -312,7 +316,23 @@ fn disable(entry: &MenuEntry) -> bool {
     use crate::reg::Key;
     match entry.kind {
         Kind::Handler => {
-            Key::create_user(BLOCKED_KEY).is_some_and(|k| k.set_string(&entry.clsid, &entry.text))
+            let marker = format!("{HANDLER_MARKER_PREFIX}{}", entry.clsid);
+            Key::create_user(BLOCKED_KEY).is_some_and(|k| {
+                // Do not overwrite a block created by another tool. An
+                // explicit marker gives `on` ownership of only our value.
+                if k.has_value(&entry.clsid) {
+                    return k.has_value(&marker);
+                }
+                if !k.set_string(&entry.clsid, &entry.text) {
+                    return false;
+                }
+                if k.set_string(&marker, "1") {
+                    true
+                } else {
+                    let _ = k.delete_value(&entry.clsid);
+                    false
+                }
+            })
         }
         Kind::Verb => {
             // shadow the verb in HKCU\Software\Classes; merged HKCR view
@@ -322,7 +342,20 @@ fn disable(entry: &MenuEntry) -> bool {
                 entry.scope.reg_path(),
                 entry.id
             );
-            Key::create_user(&path).is_some_and(|k| k.set_string("LegacyDisable", ""))
+            Key::create_user(&path).is_some_and(|k| {
+                if k.has_value("LegacyDisable") {
+                    return k.has_value(VERB_MARKER);
+                }
+                if !k.set_string("LegacyDisable", "") {
+                    return false;
+                }
+                if k.set_string(VERB_MARKER, "1") {
+                    true
+                } else {
+                    let _ = k.delete_value("LegacyDisable");
+                    false
+                }
+            })
         }
     }
 }
@@ -332,7 +365,15 @@ fn enable(entry: &MenuEntry) -> bool {
     use crate::reg::Key;
     match entry.kind {
         Kind::Handler => {
-            Key::open_user_rw(BLOCKED_KEY).is_some_and(|k| k.delete_value(&entry.clsid))
+            let marker = format!("{HANDLER_MARKER_PREFIX}{}", entry.clsid);
+            Key::open_user_rw(BLOCKED_KEY).is_some_and(|k| {
+                if !k.has_value(&marker) {
+                    return false;
+                }
+                let removed = k.delete_value(&entry.clsid);
+                let _ = k.delete_value(&marker);
+                removed
+            })
         }
         Kind::Verb => {
             let path = format!(
@@ -340,7 +381,14 @@ fn enable(entry: &MenuEntry) -> bool {
                 entry.scope.reg_path(),
                 entry.id
             );
-            Key::open_user_rw(&path).is_some_and(|k| k.delete_value("LegacyDisable"))
+            Key::open_user_rw(&path).is_some_and(|k| {
+                if !k.has_value(VERB_MARKER) {
+                    return false;
+                }
+                let removed = k.delete_value("LegacyDisable");
+                let _ = k.delete_value(VERB_MARKER);
+                removed
+            })
         }
     }
 }

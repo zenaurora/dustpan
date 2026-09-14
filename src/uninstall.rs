@@ -13,11 +13,13 @@
 //! Registry leftovers are reported but never deleted: dustpan writes to
 //! the filesystem only, keeping the "read-only registry" promise.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use crate::apps::{self, AppEntry, Source};
 use crate::clean::Cleaner;
+use crate::fsutil::is_link_or_reparse;
 use crate::safety::Safety;
 use crate::scan::entry_size;
 use crate::ui::{confirm, fmt_size, Style};
@@ -124,21 +126,18 @@ pub fn uninstall_app(app: &AppEntry, opts: &UninstallOptions, pre_confirmed: boo
 /// Turn an UninstallString into an argv. MSI entries get normalized to
 /// `msiexec /x {GUID} /qb` regardless of how the vendor spelled them
 /// (`/I{GUID}`, `/X{GUID}`, mixed quoting...), following BCUninstaller.
-/// steam:// protocol URLs are handed to the shell so Steam picks them up.
+/// steam:// protocol URLs are handed to the Windows protocol handler so Steam
+/// picks them up without passing the value through `cmd.exe`.
 pub fn uninstall_command(uninstall_string: &str) -> Option<Vec<String>> {
     let s = uninstall_string.trim();
     if s.is_empty() {
         return None;
     }
-    if s.starts_with("steam://") {
-        // `start` resolves the protocol handler; empty "" is the window title
-        return Some(vec![
-            "cmd".into(),
-            "/C".into(),
-            "start".into(),
-            "".into(),
-            s.into(),
-        ]);
+    if let Some(app_id) = s.strip_prefix("steam://uninstall/") {
+        if app_id.is_empty() || !app_id.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        return Some(vec![format!("steam://uninstall/{app_id}")]);
     }
     if let Some(guid) = extract_msi_guid(s) {
         return Some(vec![
@@ -187,15 +186,66 @@ pub fn split_command_line(s: &str) -> Option<Vec<String>> {
         )
     };
     let mut argv = vec![program];
-    argv.extend(rest.split_whitespace().map(String::from));
+    argv.extend(split_windows_args(rest));
     Some(argv)
 }
 
+/// Parse the argument portion of a Windows command line. Backslashes before
+/// quotes follow the CommandLineToArgvW rules; this keeps quoted arguments
+/// intact without invoking a shell.
+fn split_windows_args(input: &str) -> Vec<String> {
+    let chars: Vec<char> = input.chars().collect();
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i].is_whitespace() && !quoted {
+            if !current.is_empty() {
+                args.push(std::mem::take(&mut current));
+            }
+            i += 1;
+            continue;
+        }
+        if chars[i] == '\\' {
+            let start = i;
+            while i < chars.len() && chars[i] == '\\' {
+                i += 1;
+            }
+            let count = i - start;
+            if i < chars.len() && chars[i] == '"' {
+                current.extend(std::iter::repeat_n('\\', count / 2));
+                if count % 2 == 1 {
+                    current.push('"');
+                    i += 1;
+                } else {
+                    quoted = !quoted;
+                    i += 1;
+                }
+            } else {
+                current.extend(std::iter::repeat_n('\\', count));
+            }
+            continue;
+        }
+        if chars[i] == '"' {
+            quoted = !quoted;
+        } else {
+            current.push(chars[i]);
+        }
+        i += 1;
+    }
+    if !current.is_empty() {
+        args.push(current);
+    }
+    args
+}
+
 fn run_vendor_uninstaller(app: &AppEntry, opts: &UninstallOptions, style: &Style) -> bool {
-    let Some(argv) = uninstall_command(&app.uninstall_string) else {
+    let Some(mut argv) = uninstall_command(&app.uninstall_string) else {
         eprintln!("no usable UninstallString for {}", app.name);
         return false;
     };
+    prepare_launch_command(&mut argv);
     println!("{} {}", style.dim("running:"), argv.join(" "));
     if opts.dry_run {
         return true;
@@ -204,7 +254,12 @@ fn run_vendor_uninstaller(app: &AppEntry, opts: &UninstallOptions, style: &Style
         println!("{}", style.yellow("not on Windows, skipping execution"));
         return true;
     }
-    match launch_uninstaller_with(&argv, direct_exit_code, |args| {
+    // Only machine-wide entries are eligible for UAC retry. HKCU uninstall
+    // strings are user-writable, so even an absolute path must not be replayed
+    // elevated. This preserves the useful machine-app flow without turning a
+    // per-user registry value into an admin process launcher.
+    let allow_elevation = can_elevate(app.source);
+    match launch_uninstaller_with(&argv, allow_elevation, direct_exit_code, |args| {
         println!(
             "{}",
             style.yellow("administrator permission required; opening UAC prompt...")
@@ -238,22 +293,114 @@ fn run_vendor_uninstaller(app: &AppEntry, opts: &UninstallOptions, style: &Style
     }
 }
 
+fn prepare_launch_command(argv: &mut [String]) {
+    #[cfg(windows)]
+    if argv.first().is_some_and(|program| {
+        program.eq_ignore_ascii_case("msiexec") || program.eq_ignore_ascii_case("msiexec.exe")
+    }) {
+        if let Some(root) = std::env::var_os("SystemRoot") {
+            argv[0] = PathBuf::from(root)
+                .join("System32")
+                .join("msiexec.exe")
+                .display()
+                .to_string();
+        }
+    }
+}
+
+fn can_elevate(source: Source) -> bool {
+    match source {
+        Source::Machine | Source::Machine32 => true,
+        Source::User => false,
+        Source::Steam | Source::Portable => false,
+    }
+}
+
 fn launch_uninstaller_with(
     argv: &[String],
+    allow_elevation: bool,
     direct: impl FnOnce(&[String]) -> std::io::Result<i32>,
     elevated: impl FnOnce(&[String]) -> std::io::Result<i32>,
 ) -> std::io::Result<i32> {
     match direct(argv) {
-        Err(error) if error.raw_os_error() == Some(740) => elevated(argv),
+        Err(error) if error.raw_os_error() == Some(740) && allow_elevation => elevated(argv),
+        Err(error) if error.raw_os_error() == Some(740) => Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "uninstaller requires elevation; refusing to elevate a per-user command",
+        )),
         result => result,
     }
 }
 
 fn direct_exit_code(argv: &[String]) -> std::io::Result<i32> {
+    if argv.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "empty uninstaller command",
+        ));
+    }
+    #[cfg(windows)]
+    if argv.len() == 1 && argv[0].starts_with("steam://uninstall/") {
+        return windows_protocol::open(&argv[0]);
+    }
     std::process::Command::new(&argv[0])
         .args(&argv[1..])
         .status()
         .map(|status| status.code().unwrap_or(-1))
+}
+
+#[cfg(windows)]
+mod windows_protocol {
+    use std::ffi::{c_void, OsStr};
+    use std::io;
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+
+    const SW_SHOWNORMAL: i32 = 1;
+
+    #[link(name = "shell32")]
+    extern "system" {
+        fn ShellExecuteW(
+            hwnd: *mut c_void,
+            operation: *const u16,
+            file: *const u16,
+            parameters: *const u16,
+            directory: *const u16,
+            show: i32,
+        ) -> isize;
+    }
+
+    fn wide(value: &str) -> Vec<u16> {
+        OsStr::new(value).encode_wide().chain(Some(0)).collect()
+    }
+
+    pub fn open(url: &str) -> io::Result<i32> {
+        let operation = wide("open");
+        let file = wide(url);
+        let result = unsafe {
+            ShellExecuteW(
+                ptr::null_mut(),
+                operation.as_ptr(),
+                file.as_ptr(),
+                ptr::null(),
+                ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        if result <= 32 {
+            if result > 0 {
+                Err(io::Error::from_raw_os_error(result as i32))
+            } else {
+                Err(io::Error::other(
+                    "Windows could not open the protocol handler",
+                ))
+            }
+        } else {
+            // Protocol handlers are asynchronous; a successful handoff is
+            // the only exit status available to the caller.
+            Ok(0)
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -417,6 +564,17 @@ fn uninstall_portable(app: &AppEntry, opts: &UninstallOptions, style: &Style) ->
     // uninstall. Route it through the standard gate for safety + audit.
     let safety = Safety::load().with_extra_allowed_bases(&apps::portable_roots());
     let path = PathBuf::from(&app.location);
+    let Some(meta) = path.symlink_metadata().ok() else {
+        eprintln!("refusing to delete {}: path does not exist", path.display());
+        return false;
+    };
+    if is_link_or_reparse(&meta) {
+        eprintln!(
+            "refusing to delete {}: portable app root is a reparse point",
+            path.display()
+        );
+        return false;
+    }
     if let Err(reason) = safety.check(&path) {
         eprintln!("refusing to delete {}: {reason}", path.display());
         return false;
@@ -502,12 +660,21 @@ fn find_leftovers_in_roots(app: &AppEntry, roots: &[PathBuf]) -> Vec<Leftover> {
     let publisher = app.publisher.trim().to_lowercase();
     let mut found = Vec::new();
     for root in roots {
+        if root
+            .symlink_metadata()
+            .is_ok_and(|meta| is_link_or_reparse(&meta))
+        {
+            continue;
+        }
         let Ok(rd) = std::fs::read_dir(root) else {
             continue;
         };
         for entry in rd.flatten() {
             let path = entry.path();
-            if !path.is_dir() {
+            let Ok(meta) = path.symlink_metadata() else {
+                continue;
+            };
+            if is_link_or_reparse(&meta) || !meta.is_dir() {
                 continue;
             }
             let dir_name = entry.file_name().to_string_lossy().to_lowercase();
@@ -528,8 +695,14 @@ fn find_leftovers_in_roots(app: &AppEntry, roots: &[PathBuf]) -> Vec<Leftover> {
             };
             for child in children.flatten() {
                 let child_path = child.path();
+                let Ok(child_meta) = child_path.symlink_metadata() else {
+                    continue;
+                };
                 let child_name = child.file_name().to_string_lossy().to_lowercase();
-                if child_path.is_dir() && variants.contains(&child_name) {
+                if !is_link_or_reparse(&child_meta)
+                    && child_meta.is_dir()
+                    && variants.contains(&child_name)
+                {
                     found.push(Leftover {
                         size: entry_size(&child_path),
                         path: child_path,
@@ -541,13 +714,27 @@ fn find_leftovers_in_roots(app: &AppEntry, roots: &[PathBuf]) -> Vec<Leftover> {
     // The install location itself often survives (empty or with logs).
     if !app.location.is_empty() {
         let loc = PathBuf::from(&app.location);
-        if loc.is_dir() && app.source != Source::Portable {
+        if app.source != Source::Portable
+            && loc
+                .symlink_metadata()
+                .is_ok_and(|meta| !is_link_or_reparse(&meta) && meta.is_dir())
+        {
             found.push(Leftover {
                 size: entry_size(&loc),
                 path: loc,
             });
         }
     }
+    let mut seen = HashSet::new();
+    found.retain(|leftover| {
+        seen.insert(
+            leftover
+                .path
+                .to_string_lossy()
+                .replace('/', "\\")
+                .to_lowercase(),
+        )
+    });
     found
 }
 
@@ -625,7 +812,7 @@ mod tests {
     #[test]
     fn steam_urls_launch_via_protocol_handler() {
         let cmd = uninstall_command("steam://uninstall/570").unwrap();
-        assert_eq!(cmd, vec!["cmd", "/C", "start", "", "steam://uninstall/570"]);
+        assert_eq!(cmd, vec!["steam://uninstall/570"]);
     }
 
     #[test]
@@ -664,6 +851,7 @@ mod tests {
         let argv = vec![r"D:\miHoYo Launcher\uninstall.exe".to_string()];
         let result = launch_uninstaller_with(
             &argv,
+            true,
             |_| Err(std::io::Error::from_raw_os_error(740)),
             |_| {
                 elevated.set(true);
@@ -673,6 +861,23 @@ mod tests {
 
         assert_eq!(result.unwrap(), 0);
         assert!(elevated.get(), "ERROR_ELEVATION_REQUIRED must invoke UAC");
+    }
+
+    #[test]
+    fn per_user_elevation_is_refused() {
+        let elevated = std::cell::Cell::new(false);
+        let argv = vec!["user-uninstaller.exe".to_string()];
+        let result = launch_uninstaller_with(
+            &argv,
+            false,
+            |_| Err(std::io::Error::from_raw_os_error(740)),
+            |_| {
+                elevated.set(true);
+                Ok(0)
+            },
+        );
+        assert!(result.is_err());
+        assert!(!elevated.get());
     }
 
     #[test]

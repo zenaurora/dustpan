@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 use crate::apps::{AppEntry, Source};
 use crate::clean::iso_from_unix;
+use crate::fsutil::is_link_or_reparse;
 
 pub fn collect() -> Vec<AppEntry> {
     let mut libraries: Vec<PathBuf> = Vec::new();
@@ -45,8 +46,13 @@ fn norm_lib(p: &Path) -> String {
         .to_string()
 }
 
+fn is_real_dir(path: &Path) -> bool {
+    path.symlink_metadata()
+        .is_ok_and(|meta| meta.is_dir() && !is_link_or_reparse(&meta))
+}
+
 fn add_library(libraries: &mut Vec<PathBuf>, seen: &mut HashSet<String>, p: PathBuf) {
-    if p.is_dir() && seen.insert(norm_lib(&p)) {
+    if is_real_dir(&p) && seen.insert(norm_lib(&p)) {
         libraries.push(p);
     }
 }
@@ -69,14 +75,14 @@ fn drive_scan_libraries() -> Vec<PathBuf> {
     }
     (b'A'..=b'Z')
         .map(|letter| PathBuf::from(format!("{}:\\SteamLibrary", letter as char)))
-        .filter(|p| p.join("steamapps").is_dir())
+        .filter(|p| is_real_dir(&p.join("steamapps")))
         .collect()
 }
 
 fn steam_root() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("DPAN_STEAM_DIR") {
         let p = PathBuf::from(dir);
-        if p.is_dir() {
+        if is_real_dir(&p) {
             return Some(p);
         }
         // invalid override: fall through to normal discovery
@@ -88,14 +94,14 @@ fn steam_root() -> Option<PathBuf> {
             let path = key.string_value("SteamPath");
             if !path.is_empty() {
                 let p = PathBuf::from(path);
-                if p.is_dir() {
+                if is_real_dir(&p) {
                     return Some(p);
                 }
             }
         }
         if let Ok(pf) = std::env::var("ProgramFiles(x86)") {
             let p = PathBuf::from(pf).join("Steam");
-            if p.is_dir() {
+            if is_real_dir(&p) {
                 return Some(p);
             }
         }
@@ -133,15 +139,27 @@ fn scan_library(lib: &Path) -> Vec<AppEntry> {
         let Some(game) = parse_acf(&content) else {
             continue;
         };
+        // The manifest is user-controlled text. Keep inventory paths inside
+        // this Steam library; uninstall is still handed back to Steam.
+        if game.installdir.is_empty()
+            || Path::new(&game.installdir).is_absolute()
+            || Path::new(&game.installdir)
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            continue;
+        }
+        let location = steamapps.join("common").join(&game.installdir);
+        if let Ok(meta) = location.symlink_metadata() {
+            if is_link_or_reparse(&meta) {
+                continue;
+            }
+        }
         games.push(AppEntry {
             name: game.name,
             version: String::new(),
             publisher: "Steam".into(),
-            location: steamapps
-                .join("common")
-                .join(&game.installdir)
-                .display()
-                .to_string(),
+            location: location.display().to_string(),
             uninstall_string: format!("steam://uninstall/{}", game.appid),
             reg_key: String::new(),
             size_bytes: (game.size_on_disk > 0).then_some(game.size_on_disk),

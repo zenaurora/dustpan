@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::thread;
 
+use crate::fsutil::is_link_or_reparse;
 use crate::targets::ResolvedTarget;
 
 /// Size of a single entry: file length, or recursive size for a directory.
@@ -13,7 +14,9 @@ pub fn entry_size(path: &Path) -> u64 {
     let Ok(meta) = path.symlink_metadata() else {
         return 0;
     };
-    if meta.is_dir() {
+    if is_link_or_reparse(&meta) {
+        0
+    } else if meta.is_dir() {
         dir_size(path)
     } else {
         meta.len()
@@ -26,10 +29,10 @@ fn dir_size(path: &Path) -> u64 {
     };
     let mut total = 0u64;
     for entry in entries.flatten() {
-        let Ok(meta) = entry.metadata() else {
+        let Ok(meta) = entry.path().symlink_metadata() else {
             continue;
         };
-        if meta.is_symlink() {
+        if is_link_or_reparse(&meta) {
             continue;
         }
         if meta.is_dir() {
