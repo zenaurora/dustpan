@@ -49,6 +49,16 @@ impl Category {
             Category::Apps => "Apps",
         }
     }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Category::Temp => "temp",
+            Category::System => "system",
+            Category::Browser => "browser",
+            Category::Dev => "dev",
+            Category::Apps => "apps",
+        }
+    }
 }
 
 /// How a resolved path should be cleaned.

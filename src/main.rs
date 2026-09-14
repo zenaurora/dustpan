@@ -14,6 +14,7 @@ mod menu;
 mod reg;
 mod safety;
 mod scan;
+mod settings;
 mod steam;
 mod targets;
 mod term;
@@ -92,25 +93,66 @@ fn parse_args() -> Result<Option<Cli>, String> {
 }
 
 fn run_menu() -> ExitCode {
-    match menu::choose() {
-        Some(menu::Action::Clean) => match menu::choose_clean() {
-            Some(selection) => run(&Options {
-                recycle_bin: selection.recycle_bin,
-                only: selection.only,
-                ..Options::default()
-            }),
-            None => ExitCode::SUCCESS,
-        },
-        Some(menu::Action::Apps) => apps::run(&apps::AppsOptions::default()),
-        Some(menu::Action::Analyze) => match menu::choose_analyze() {
-            Some(selection) => analyze::run(&analyze::AnalyzeOptions {
-                path: Some(selection.path),
-                ..analyze::AnalyzeOptions::default()
-            }),
-            None => ExitCode::SUCCESS,
-        },
-        Some(menu::Action::Ctxmenu) => ctxmenu::interactive(),
-        None => ExitCode::SUCCESS,
+    let mut settings = settings::Settings::load();
+    loop {
+        match menu::choose() {
+            Some(menu::Action::Clean) => match menu::choose_clean(&settings) {
+                Some(selection) => {
+                    settings.categories = selection.categories;
+                    settings.recycle_bin = selection.recycle_bin;
+                    if let Err(error) = settings.save() {
+                        eprintln!("warning: could not save preferences: {error}");
+                    }
+                    let only = (settings.categories.len() != Category::ALL.len())
+                        .then(|| settings.categories.clone());
+                    let result = run(&Options {
+                        yes: !settings.confirm_clean,
+                        recycle_bin: settings.recycle_bin,
+                        only,
+                        ..Options::default()
+                    });
+                    if result != ExitCode::SUCCESS {
+                        eprintln!("cleaning completed with errors");
+                    }
+                    ui::pause("\nPress Enter to return to the menu...");
+                }
+                None => continue,
+            },
+            Some(menu::Action::Apps) => {
+                let result = apps::run(&apps::AppsOptions::default());
+                if result != ExitCode::SUCCESS {
+                    ui::pause("\nPress Enter to return to the menu...");
+                }
+            }
+            Some(menu::Action::Analyze) => match menu::choose_analyze() {
+                Some(selection) => {
+                    let result = analyze::run(&analyze::AnalyzeOptions {
+                        path: Some(selection.path),
+                        ..analyze::AnalyzeOptions::default()
+                    });
+                    if result != ExitCode::SUCCESS {
+                        ui::pause("\nPress Enter to return to the menu...");
+                    }
+                }
+                None => continue,
+            },
+            Some(menu::Action::Ctxmenu) => {
+                let _ = ctxmenu::interactive();
+            }
+            Some(menu::Action::Settings) => {
+                if let Some(updated) = menu::choose_settings(&settings) {
+                    match updated.save() {
+                        Ok(()) => {
+                            settings = updated;
+                            println!("Settings saved.");
+                        }
+                        Err(error) => eprintln!("could not save settings: {error}"),
+                    }
+                    ui::pause("Press Enter to return to the menu...");
+                }
+            }
+            None => return ExitCode::SUCCESS,
+        }
     }
 }
 
@@ -317,7 +359,7 @@ ANALYZE OPTIONS (read-only disk usage explorer):
     [PATH]               Directory to analyze (default: home directory)
         --json           Print sizes as JSON and exit (for scripting)
         --top <n>        Entries shown per directory (default: 40)
-    Without arguments, Analyze offers Home/Desktop/Downloads/Documents first.
+    Without arguments, Analyze offers common folders, drives, and custom paths.
 
 APPS OPTIONS (interactive app list, biggest first):
     [FILTER]             Only show apps whose name contains FILTER
@@ -339,12 +381,17 @@ CTXMENU OPTIONS (right-click menu manager, no admin needed):
         --json                   List as JSON
     Without arguments, Context Menu opens a keyboard-driven on/off browser.
 
+INTERACTIVE SETTINGS:
+    The Settings screen remembers cleaning areas, Recycle Bin, confirmation,
+    and color preferences for future argument-free runs.
+
 COMMON OPTIONS:
     -h, --help           Show this help
     -V, --version        Show version
         --no-color       Disable ANSI color output
 
 FILES:
+    settings        %APPDATA%\\dustpan\\settings.conf
     whitelist       %APPDATA%\\dustpan\\whitelist.txt       (one path/glob per line)
     portable dirs   %APPDATA%\\dustpan\\portable_dirs.txt   (extra apps scan roots)
     audit log       %LOCALAPPDATA%\\dustpan\\operations.log"

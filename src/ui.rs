@@ -1,6 +1,6 @@
 //! Terminal output helpers: colors, size formatting, confirm prompt.
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 
 pub struct Style {
     on: bool,
@@ -9,7 +9,9 @@ pub struct Style {
 impl Style {
     pub fn auto() -> Style {
         Style {
-            on: std::env::var_os("DPAN_NO_COLOR").is_none() && crate::term::enable_color(),
+            on: std::env::var_os("DPAN_NO_COLOR").is_none()
+                && crate::settings::Settings::load().color
+                && crate::term::enable_color(),
         }
     }
 
@@ -133,6 +135,18 @@ pub fn confirm(prompt: &str) -> bool {
         return false;
     }
     matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// Keep result output visible before an argument-free workflow returns to its
+/// full-screen menu. Non-interactive callers never block.
+pub fn pause(prompt: &str) {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return;
+    }
+    print!("{prompt}");
+    let _ = io::stdout().flush();
+    let mut line = String::new();
+    let _ = io::stdin().read_line(&mut line);
 }
 
 #[cfg(test)]

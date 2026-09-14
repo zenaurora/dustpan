@@ -43,10 +43,13 @@ dpan ctxmenu on 百度      # 恢复
 
 - **Clean**：先选择临时文件、系统缓存、浏览器缓存、开发缓存、应用缓存和回收站，再扫描、预览、确认。
 - **Apps**：直接浏览应用并按 Enter 卸载，空格可以多选。
-- **Analyze**：选择 Home、Desktop、Downloads、Documents 或 Pictures 后进入磁盘占用浏览。
+- **Analyze**：选择常用目录、任意磁盘或输入自定义路径后进入磁盘占用浏览。
 - **Context Menu**：直接浏览右键菜单项，Enter/空格切换启用状态。
+- **Settings**：设置默认清理类别、回收站、删除前确认和颜色；选择会持久保存。
 
 命令行参数保留给脚本、自动化和少数高级操作；普通用户只运行 `dpan` 即可。
+
+交互偏好保存在 `%APPDATA%\dustpan\settings.conf`。清理选择器也会自动记住最近一次选择。
 
 ## analyze（只读磁盘占用浏览）
 
