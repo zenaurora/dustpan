@@ -15,7 +15,7 @@ Windows `clean`（缓存清理）+ `analyze`（磁盘占用浏览）的 CLI。
 
 ```console
 dpan                     # 交互菜单（推荐）
-dpan clean               # 扫描 → 预览 → 确认 → 清理
+dpan clean               # 默认 Smart Clean：扫描 → 预览 → 确认 → 清理
 dpan clean --dry-run     # 只看能清多少，不删
 dpan clean --only dev,browser  # 限定类别：temp / system / browser / dev / apps
 dpan clean --list        # 列出本机命中的清理目标
@@ -41,7 +41,7 @@ dpan ctxmenu on 百度      # 恢复
 
 无参数菜单里的常用流程：
 
-- **Clean**：先选择临时文件、系统缓存、浏览器缓存、开发缓存、应用缓存和回收站，再扫描、预览、确认。
+- **Clean**：直接进入 Smart Clean。它会自动清理低风险缓存；扫描时仍会列出 npm、pip、Cargo、NuGet 等高成本缓存，并显示体积、重新下载成本和需要管理员权限等原因。交互式运行可输入编号（或 `all`）把这些项目加入本次计划，直接回车则保持安全默认。
 - **Apps**：直接浏览应用并按 Enter 卸载，空格可以多选。
 - **Analyze**：选择常用目录、任意磁盘或输入自定义路径后进入磁盘占用浏览。
 - **Context Menu**：直接浏览右键菜单项，Enter/空格切换启用状态。

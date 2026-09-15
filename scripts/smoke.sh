@@ -27,7 +27,8 @@ echo "=== dry run ===";  "$BIN" --dry-run --no-color
 echo "=== real run ==="; "$BIN" --yes --no-color --verbose
 echo "=== assertions ==="
 test -f "$FAKE/AppData/Local/npm-cache/precious.tgz" && echo "OK whitelisted file survived"
-test ! -f "$FAKE/AppData/Local/npm-cache/pkg.tgz" && echo "OK cache file removed"
+# npm 属于高重新下载成本缓存；--yes 采用 Smart Clean 默认计划，不应静默删除。
+test -f "$FAKE/AppData/Local/npm-cache/pkg.tgz" && echo "OK expensive cache stayed optional"
 test ! -f "$FAKE/Temp/tmpfile" && echo "OK temp file removed"
 test -d "$FAKE/AppData/Local/pip/cache" && echo "OK target dir itself kept"
 echo "=== audit log ==="

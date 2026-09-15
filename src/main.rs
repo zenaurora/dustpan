@@ -21,9 +21,10 @@ mod term;
 mod ui;
 mod uninstall;
 
+use std::io::IsTerminal;
 use std::process::ExitCode;
 
-use clean::{CleanStats, Cleaner};
+use clean::{CleanPlan, CleanStats, Cleaner};
 use safety::Safety;
 use targets::{Category, ResolvedTarget};
 use ui::{fmt_size, Style};
@@ -96,28 +97,22 @@ fn run_menu() -> ExitCode {
     let mut settings = settings::Settings::load();
     loop {
         match menu::choose() {
-            Some(menu::Action::Clean) => match menu::choose_clean(&settings) {
-                Some(selection) => {
-                    settings.categories = selection.categories;
-                    settings.recycle_bin = selection.recycle_bin;
-                    if let Err(error) = settings.save() {
-                        eprintln!("warning: could not save preferences: {error}");
-                    }
-                    let only = (settings.categories.len() != Category::ALL.len())
-                        .then(|| settings.categories.clone());
-                    let result = run(&Options {
-                        yes: !settings.confirm_clean,
-                        recycle_bin: settings.recycle_bin,
-                        only,
-                        ..Options::default()
-                    });
-                    if result != ExitCode::SUCCESS {
-                        eprintln!("cleaning completed with errors");
-                    }
-                    ui::pause("\nPress Enter to return to the menu...");
+            Some(menu::Action::Clean) => {
+                // 主菜单默认高亮 Clean，按一次 Enter 就进入扫描；首次运行
+                // 不需要了解分类，也不要求先创建配置文件。
+                let only = (settings.categories.len() != Category::ALL.len())
+                    .then(|| settings.categories.clone());
+                let result = run(&Options {
+                    yes: !settings.confirm_clean,
+                    recycle_bin: settings.recycle_bin,
+                    only,
+                    ..Options::default()
+                });
+                if result != ExitCode::SUCCESS {
+                    eprintln!("cleaning completed with errors");
                 }
-                None => continue,
-            },
+                ui::pause("\nPress Enter to return to the menu...");
+            }
             Some(menu::Action::Apps) => {
                 let result = apps::run(&apps::AppsOptions::default());
                 if result != ExitCode::SUCCESS {
@@ -400,9 +395,10 @@ FILES:
 
 fn run(opts: &Options) -> ExitCode {
     let style = Style::auto();
-    let resolved = targets::resolve_targets(opts.only.as_deref());
+    let mut plan = CleanPlan::discover(opts.only.as_deref());
+    let discovered = plan.all_resolved();
 
-    if resolved.is_empty() && !opts.recycle_bin {
+    if discovered.is_empty() && !opts.recycle_bin {
         println!("No cleanable targets found on this system.");
         if !cfg!(windows) {
             println!(
@@ -414,7 +410,7 @@ fn run(opts: &Options) -> ExitCode {
     }
 
     if opts.list {
-        print_target_list(&resolved, &style);
+        print_target_list(&discovered, &style);
         return ExitCode::SUCCESS;
     }
 
@@ -428,8 +424,11 @@ fn run(opts: &Options) -> ExitCode {
         }
     );
     println!("{}", style.dim("scanning..."));
-    let sizes = scan::scan_sizes(&resolved);
-    let total: u64 = sizes.iter().sum();
+    plan.preview();
+    choose_optional_targets(&mut plan, opts, &style);
+    let resolved = plan.resolved();
+    let sizes: Vec<u64> = plan.targets.iter().map(|p| p.size).collect();
+    let total = plan.total();
 
     print_preview(&resolved, &sizes, opts.verbose, &style);
     println!(
@@ -450,16 +449,60 @@ fn run(opts: &Options) -> ExitCode {
     println!();
 
     let safety = Safety::load();
+    if plan.requires_admin() && !clean::is_elevated() {
+        println!("{}", style.yellow(clean::explain_elevation()));
+    }
+    let running_apps = clean::running_cache_apps(&plan);
+    if !running_apps.is_empty() && !opts.dry_run {
+        println!(
+            "{} {}",
+            style.yellow("Cache owners are running:"),
+            running_apps.join(", ")
+        );
+        println!("Close them first so all cache files can be removed.");
+        if !opts.yes && !ui::confirm("Continue and retry locked files later?") {
+            println!("Aborted, nothing was deleted.");
+            return ExitCode::SUCCESS;
+        }
+    }
     let mut cleaner = Cleaner::new(&safety, opts.dry_run);
     let mut stats = CleanStats::default();
-    for target in &resolved {
-        let s = cleaner.clean_target(target);
+    for planned in &plan.targets {
+        // 提权权限按目标设置而不是全局开启：浏览器、开发工具和普通应用
+        // 缓存始终使用当前用户令牌，只有 Windows 系统缓存允许触发 UAC。
+        cleaner.set_elevation_for_target(planned.metadata.requires_admin);
+        let s = cleaner.clean_target(&planned.target);
         stats.merge(&s);
     }
 
     if opts.verbose {
         for line in &cleaner.verbose_lines {
             println!("{}", style.dim(line));
+        }
+    }
+
+    if stats.failed > 0 && !opts.dry_run && std::io::stdin().is_terminal() {
+        let apps = clean::running_cache_apps(&plan);
+        if !apps.is_empty() {
+            println!("{} {}", style.yellow("Still in use:"), apps.join(", "));
+            println!(
+                "{}",
+                style.dim("Close the listed programs, then choose retry.")
+            );
+        }
+        if ui::confirm("Retry failed entries now?") {
+            let retry = cleaner.retry_failed(&stats.failed_paths.clone());
+            // retry 只覆盖首轮失败项，因此失败数和失败详情应替换而不是
+            // 累加；释放空间和成功数仍需计入整次清理报告。
+            stats.freed += retry.freed;
+            stats.deleted += retry.deleted;
+            stats.skipped += retry.skipped;
+            stats.failed = retry.failed;
+            stats.failed_paths = retry.failed_paths;
+            stats.failure_reasons = retry.failure_reasons;
+            if retry.deleted > 0 {
+                println!("{} retried entries removed", style.green("✓"));
+            }
         }
     }
 
@@ -474,12 +517,17 @@ fn run(opts: &Options) -> ExitCode {
     if stats.failed > 0 {
         println!(
             "{}",
-            style.yellow(&format!(
-                "  {} entries locked or in use, skipped",
-                stats.failed
-            ))
+            style.yellow(&format!("  {} entries could not be removed", stats.failed))
         );
+        for reason in stats
+            .failure_reasons
+            .iter()
+            .take(if opts.verbose { usize::MAX } else { 8 })
+        {
+            println!("{}", style.dim(&format!("  {reason}")));
+        }
     }
+
     if stats.skipped > 0 {
         println!(
             "{}",
@@ -507,6 +555,81 @@ fn run(opts: &Options) -> ExitCode {
     }
 }
 
+/// 展示 Smart Clean 发现但默认不选的目标。编号只对应实际占用空间大于 0
+/// 的条目；直接回车保持安全默认，输入 `all` 或逗号分隔编号才会加入计划。
+fn choose_optional_targets(plan: &mut CleanPlan, opts: &Options, style: &Style) {
+    let choices: Vec<(usize, &clean::PlannedTarget)> = plan
+        .optional
+        .iter()
+        .enumerate()
+        .filter(|(_, planned)| planned.size > 0)
+        .collect();
+    if choices.is_empty() {
+        return;
+    }
+
+    println!("\n{}", style.bold("Additional caches found (not selected)"));
+    println!(
+        "{}",
+        style.dim("These are safe to inspect, but may be slow or expensive to download again.")
+    );
+    for (display_index, (_, planned)) in choices.iter().enumerate() {
+        let reason = if planned.metadata.expensive {
+            "high re-download cost"
+        } else if planned.metadata.requires_admin {
+            "needs administrator permission"
+        } else {
+            "needs review"
+        };
+        println!(
+            "  {:>2}. {:<28} {:>10}  {}",
+            display_index + 1,
+            planned.target.name,
+            fmt_size(planned.size),
+            style.yellow(reason)
+        );
+    }
+
+    // -y 和管道调用必须保持完全非交互；列表仍会输出，让用户知道这些
+    // 缓存存在，但只有交互式明确选择才会把它们加入本次执行计划。
+    if opts.yes || !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        println!("{}", style.dim("Skipped by Smart Clean."));
+        return;
+    }
+
+    use std::io::Write;
+    print!("Select caches to include (e.g. 1,3 or all; Enter skips): ");
+    let _ = std::io::stdout().flush();
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return;
+    }
+    let answer = answer.trim();
+    if answer.is_empty() {
+        return;
+    }
+
+    let selected_display_indices: Vec<usize> = if answer.eq_ignore_ascii_case("all") {
+        (0..choices.len()).collect()
+    } else {
+        answer
+            .split([',', ' ', ';'])
+            .filter(|part| !part.is_empty())
+            .filter_map(|part| part.parse::<usize>().ok())
+            .filter_map(|number| number.checked_sub(1))
+            .filter(|index| *index < choices.len())
+            .collect()
+    };
+    // choices 保存的是 optional 中的原始索引；不能直接使用展示编号，
+    // 因为 size=0 的目标已从界面隐藏。
+    let optional_indices: Vec<usize> = selected_display_indices
+        .into_iter()
+        .map(|index| choices[index].0)
+        .collect();
+    drop(choices);
+    plan.include_optional(&optional_indices);
+}
+
 fn print_target_list(resolved: &[ResolvedTarget], style: &Style) {
     for cat in Category::ALL {
         let rows: Vec<&ResolvedTarget> = resolved.iter().filter(|t| t.category == cat).collect();
@@ -515,9 +638,18 @@ fn print_target_list(resolved: &[ResolvedTarget], style: &Style) {
         }
         println!("{}", style.bold(&style.cyan(cat.label())));
         for t in rows {
+            let metadata = t.metadata();
+            let policy = if metadata.risk == targets::Risk::Low && !metadata.expensive {
+                "smart default"
+            } else if metadata.expensive {
+                "optional: high re-download cost"
+            } else {
+                "optional: review required"
+            };
             println!(
-                "  {:<28} {}",
+                "  {:<28} {:<34} {}",
                 t.name,
+                style.yellow(policy),
                 style.dim(&t.path.display().to_string())
             );
         }
@@ -536,7 +668,18 @@ fn print_preview(resolved: &[ResolvedTarget], sizes: &[u64], verbose: bool, styl
         }
         println!("\n{}", style.bold(&style.cyan(cat.label())));
         for (i, t) in rows {
-            println!("  {:<28} {:>10}", t.name, fmt_size(sizes[i]));
+            let meta = t.metadata();
+            let risk = match meta.risk {
+                targets::Risk::Low => "low",
+                targets::Risk::Medium => "medium",
+            };
+            println!(
+                "  {:<28} {:>10}  [{} risk, {} re-download]",
+                t.name,
+                fmt_size(sizes[i]),
+                risk,
+                meta.redownload_cost
+            );
             if verbose {
                 println!("      {}", style.dim(&t.path.display().to_string()));
             }

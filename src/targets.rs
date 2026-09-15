@@ -334,11 +334,92 @@ pub const TARGETS: &[TargetSpec] = &[
 ];
 
 /// A template resolved to a concrete, existing path.
+#[derive(Clone, Debug)]
 pub struct ResolvedTarget {
     pub category: Category,
     pub name: &'static str,
     pub path: PathBuf,
     pub mode: Mode,
+}
+
+/// 面向用户的目标安全元数据。字段从目标知识库按名称推导，不再维护第
+/// 二份路径表，因此命令行与菜单始终使用同一套风险判断。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Risk {
+    Low,
+    Medium,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TargetMetadata {
+    pub risk: Risk,
+    pub redownload_cost: &'static str,
+    pub associated_app: Option<&'static str>,
+    pub requires_admin: bool,
+    pub expensive: bool,
+}
+
+impl ResolvedTarget {
+    pub fn metadata(&self) -> TargetMetadata {
+        metadata_for(self.category, self.name)
+    }
+}
+
+fn metadata_for(category: Category, name: &str) -> TargetMetadata {
+    // 进程名用于删除前的占用提示；这些名称是 Windows tasklist 输出中
+    // 的稳定可执行文件名，而不是展示给用户的本地化应用名。
+    let app = if name.starts_with("Chrome") {
+        Some("chrome.exe")
+    } else if name.starts_with("Edge") {
+        Some("msedge.exe")
+    } else if name.starts_with("Firefox") {
+        Some("firefox.exe")
+    } else if name.starts_with("VS Code") {
+        Some("Code.exe")
+    } else if name.starts_with("JetBrains") {
+        Some("idea64.exe")
+    } else if name.starts_with("Discord") {
+        Some("Discord.exe")
+    } else if name.starts_with("Slack") {
+        Some("slack.exe")
+    } else if name.starts_with("Teams") {
+        Some("ms-teams.exe")
+    } else {
+        None
+    };
+    // 以下缓存体积大、重新下载慢，Smart Clean 默认跳过，但会列出来供
+    // 用户按编号逐项加入本次计划。新增条目时请同步说明判断依据。
+    let expensive = matches!(
+        name,
+        "Cargo registry cache"
+            | "NuGet HTTP cache"
+            | "npm cache"
+            | "pnpm cache"
+            | "Yarn cache"
+            | "pip cache"
+            | "uv cache"
+    );
+    let risk = if category == Category::System {
+        Risk::Medium
+    } else if expensive {
+        Risk::Medium
+    } else {
+        Risk::Low
+    };
+    let redownload_cost = if expensive {
+        "high"
+    } else if category == Category::Browser || category == Category::Apps {
+        "low"
+    } else {
+        "medium"
+    };
+    TargetMetadata {
+        risk,
+        redownload_cost,
+        associated_app: app,
+        requires_admin: category == Category::System,
+        expensive,
+    }
 }
 
 pub fn resolve_targets(only: Option<&[Category]>) -> Vec<ResolvedTarget> {
